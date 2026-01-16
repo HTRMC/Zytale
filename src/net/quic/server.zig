@@ -63,14 +63,24 @@ pub const QuicServer = struct {
             .Buffer = @constCast(@ptrCast(self.alpn.ptr)),
         }};
 
-        // Create settings
+        // Create settings (matching official Hytale server)
         var settings: msquic.QUIC_SETTINGS = .{};
         settings.IdleTimeoutMs = 30000;
         settings.IsSetFlags |= msquic.QUIC_SETTINGS.IDLE_TIMEOUT_MS;
         settings.ServerResumptionLevel = 2; // QUIC_SERVER_RESUME_AND_ZERORTT
         settings.IsSetFlags |= msquic.QUIC_SETTINGS.SERVER_RESUMPTION_LEVEL;
-        settings.PeerBidiStreamCount = 100;
+        // Official server: initialMaxStreamsBidirectional(1L)
+        settings.PeerBidiStreamCount = 1;
         settings.IsSetFlags |= msquic.QUIC_SETTINGS.PEER_BIDI_STREAM_COUNT;
+        // Official server: initialMaxStreamsUnidirectional(0L)
+        settings.PeerUnidiStreamCount = 0;
+        settings.IsSetFlags |= msquic.QUIC_SETTINGS.PEER_UNIDI_STREAM_COUNT;
+        // Official server: initialMaxStreamDataBidirectional 131072 (128KB)
+        settings.StreamRecvWindowDefault = 131072;
+        settings.IsSetFlags |= msquic.QUIC_SETTINGS.STREAM_RECV_WINDOW_DEFAULT;
+        // Official server: initialMaxData 524288 (512KB)
+        settings.ConnFlowControlWindow = 524288;
+        settings.IsSetFlags |= msquic.QUIC_SETTINGS.CONN_FLOW_CONTROL_WINDOW;
 
         // Create configuration
         self.configuration = try q.configurationOpen(self.registration, &alpn_buffer, &settings);
@@ -84,11 +94,16 @@ pub const QuicServer = struct {
 
         var cred_config: msquic.QUIC_CREDENTIAL_CONFIG = std.mem.zeroes(msquic.QUIC_CREDENTIAL_CONFIG);
         cred_config.Type = .CERTIFICATE_FILE;
-        cred_config.Flags = msquic.QUIC_CREDENTIAL_FLAG_NONE;
+        // Require client certificate (like Java's ClientAuth.REQUIRE)
+        // Skip client cert validation (like Java's InsecureTrustManagerFactory)
+        // Indicate when we receive client cert for logging
+        cred_config.Flags = msquic.QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION |
+            msquic.QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION |
+            msquic.QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED;
         cred_config.CertificateFile = &cert_file_config;
 
         try q.configurationLoadCredential(self.configuration, &cred_config);
-        log.info("Certificate loaded from {s}", .{cert_file});
+        log.info("Certificate loaded from {s} (client auth required)", .{cert_file});
     }
 
     pub fn start(self: *Self, port: u16) !void {
@@ -201,7 +216,13 @@ pub const QuicServer = struct {
 
                 return msquic.QUIC_STATUS_SUCCESS;
             },
+            .PEER_CERTIFICATE_RECEIVED => {
+                log.info("Peer certificate received!", .{});
+                // Accept any client certificate (like InsecureTrustManagerFactory)
+                return msquic.QUIC_STATUS_SUCCESS;
+            },
             else => {
+                log.debug("Connection event: {}", .{event.Type});
                 return msquic.QUIC_STATUS_SUCCESS;
             },
         }
@@ -213,7 +234,6 @@ pub const QuicServer = struct {
         event: *msquic.QUIC_STREAM_EVENT,
     ) callconv(.c) msquic.QUIC_STATUS {
         const conn: *QuicConnection = @ptrCast(@alignCast(context));
-        _ = stream;
 
         switch (event.Type) {
             .RECEIVE => {
@@ -242,8 +262,8 @@ pub const QuicServer = struct {
                         offset += len;
                     }
 
-                    // Log the packet data
-                    logPacketData(data);
+                    // Log and handle the packet
+                    handlePacket(conn, stream, data);
                 }
 
                 return msquic.QUIC_STATUS_SUCCESS;
@@ -262,7 +282,7 @@ pub const QuicServer = struct {
         }
     }
 
-    fn logPacketData(data: []const u8) void {
+    fn handlePacket(conn: *QuicConnection, stream: msquic.HQUIC, data: []const u8) void {
         if (data.len < 8) {
             log.info("Packet too small: {d} bytes", .{data.len});
             return;
@@ -272,19 +292,59 @@ pub const QuicServer = struct {
         const payload_len = std.mem.readInt(u32, data[0..4], .little);
         const packet_id = std.mem.readInt(u32, data[4..8], .little);
 
-        log.info("Packet ID={d} (0x{X:0>4}) payload_len={d}", .{ packet_id, packet_id, payload_len });
+        log.info("Received Packet ID={d} (0x{X:0>4}) payload_len={d}", .{ packet_id, packet_id, payload_len });
 
         // Hex dump first 64 bytes
         const dump_len = @min(data.len, 64);
         var hex_buf: [64 * 3]u8 = undefined;
         var hex_idx: usize = 0;
-
         for (data[0..dump_len]) |byte| {
             const hex = std.fmt.bufPrint(hex_buf[hex_idx..], "{X:0>2} ", .{byte}) catch break;
             hex_idx += hex.len;
         }
-
         log.debug("  {s}", .{hex_buf[0..hex_idx]});
+
+        // Handle specific packets
+        switch (packet_id) {
+            0 => { // Connect packet
+                log.info("Received Connect packet, sending ConnectAccept", .{});
+                sendConnectAccept(conn, stream);
+            },
+            else => {
+                log.debug("Unhandled packet ID: {d}", .{packet_id});
+            },
+        }
+    }
+
+    fn sendConnectAccept(conn: *QuicConnection, stream: msquic.HQUIC) void {
+        // Build ConnectAccept packet (ID=14)
+        // Payload structure:
+        //   nullBits: 1 byte (0x00 = passwordChallenge is null)
+        // Total payload: 1 byte
+
+        const payload_len: u32 = 1;
+        const packet_id: u32 = 14; // ConnectAccept
+
+        // Full packet: 4 (len) + 4 (id) + 1 (payload) = 9 bytes
+        var packet: [9]u8 = undefined;
+
+        // Write header
+        std.mem.writeInt(u32, packet[0..4], payload_len, .little);
+        std.mem.writeInt(u32, packet[4..8], packet_id, .little);
+
+        // Write payload
+        packet[8] = 0x00; // nullBits: passwordChallenge is null (no password required)
+
+        // Send on stream
+        var send_buffer = [_]msquic.QUIC_BUFFER{.{
+            .Length = packet.len,
+            .Buffer = &packet,
+        }};
+
+        log.info("Sending ConnectAccept packet ({d} bytes)", .{packet.len});
+        conn.quic.streamSend(stream, &send_buffer, msquic.QUIC_SEND_FLAG_NONE, null) catch |err| {
+            log.err("Failed to send ConnectAccept packet: {}", .{err});
+        };
     }
 };
 

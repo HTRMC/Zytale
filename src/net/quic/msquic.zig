@@ -66,7 +66,15 @@ pub const QUIC_CREDENTIAL_TYPE = enum(u32) {
 // Credential flags
 pub const QUIC_CREDENTIAL_FLAG_NONE: u32 = 0x00000000;
 pub const QUIC_CREDENTIAL_FLAG_CLIENT: u32 = 0x00000001;
+pub const QUIC_CREDENTIAL_FLAG_LOAD_ASYNCHRONOUS: u32 = 0x00000002;
 pub const QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION: u32 = 0x00000004;
+pub const QUIC_CREDENTIAL_FLAG_ENABLE_OCSP: u32 = 0x00000008;
+pub const QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED: u32 = 0x00000010;
+pub const QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION: u32 = 0x00000020;
+pub const QUIC_CREDENTIAL_FLAG_USE_TLS_BUILTIN_CERTIFICATE_VALIDATION: u32 = 0x00000040;
+pub const QUIC_CREDENTIAL_FLAG_REVOCATION_CHECK_END_CERT: u32 = 0x00000080;
+pub const QUIC_CREDENTIAL_FLAG_DEFER_CERTIFICATE_VALIDATION: u32 = 0x00000200;
+pub const QUIC_CREDENTIAL_FLAG_SET_CA_CERTIFICATE_FILE: u32 = 0x00001000;
 
 // Certificate file
 pub const QUIC_CERTIFICATE_FILE = extern struct {
@@ -121,9 +129,27 @@ pub const QUIC_SETTINGS = extern struct {
     _padding: [3]u8 = [_]u8{0} ** 3,
 
     // Bit positions for IsSetFlags
+    pub const MAX_BYTES_PER_KEY: u64 = 1 << 0;
+    pub const HANDSHAKE_IDLE_TIMEOUT_MS: u64 = 1 << 1;
     pub const IDLE_TIMEOUT_MS: u64 = 1 << 3;
-    pub const SERVER_RESUMPTION_LEVEL: u64 = 1 << 21;
-    pub const PEER_BIDI_STREAM_COUNT: u64 = 1 << 19;
+    pub const TLS_CLIENT_MAX_SEND_BUFFER: u64 = 1 << 4;
+    pub const TLS_SERVER_MAX_SEND_BUFFER: u64 = 1 << 5;
+    pub const STREAM_RECV_WINDOW_DEFAULT: u64 = 1 << 6;
+    pub const STREAM_RECV_BUFFER_DEFAULT: u64 = 1 << 7;
+    pub const CONN_FLOW_CONTROL_WINDOW: u64 = 1 << 8;
+    pub const MAX_WORKER_QUEUE_DELAY_US: u64 = 1 << 9;
+    pub const MAX_STATELESS_OPERATIONS: u64 = 1 << 10;
+    pub const INITIAL_WINDOW_PACKETS: u64 = 1 << 11;
+    pub const SEND_IDLE_TIMEOUT_MS: u64 = 1 << 12;
+    pub const INITIAL_RTT_MS: u64 = 1 << 13;
+    pub const MAX_ACK_DELAY_MS: u64 = 1 << 14;
+    pub const DISCONNECT_TIMEOUT_MS: u64 = 1 << 15;
+    pub const KEEP_ALIVE_INTERVAL_MS: u64 = 1 << 16;
+    pub const CONGESTION_CONTROL_ALGORITHM: u64 = 1 << 17;
+    pub const PEER_BIDI_STREAM_COUNT: u64 = 1 << 18;
+    pub const PEER_UNIDI_STREAM_COUNT: u64 = 1 << 19;
+    pub const MAX_BINDING_STATELESS_OPERATIONS: u64 = 1 << 20;
+    pub const SERVER_RESUMPTION_LEVEL: u64 = 1 << 24;
 };
 
 // Event types
@@ -418,6 +444,14 @@ pub const MsQuic = struct {
 
     pub fn getContext(self: *Self, handle: HQUIC) ?*anyopaque {
         return self.api.GetContext(handle);
+    }
+
+    pub fn streamSend(self: *Self, stream: HQUIC, buffers: []const QUIC_BUFFER, flags: u32, context: ?*anyopaque) !void {
+        const status = self.api.StreamSend(stream, buffers.ptr, @intCast(buffers.len), flags, context);
+        if (QUIC_FAILED(status)) {
+            std.log.err("StreamSend failed: 0x{X}", .{status});
+            return error.StreamSendFailed;
+        }
     }
 };
 
