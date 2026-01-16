@@ -11,6 +11,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // QUIC module with msquic
+    const quic_module = b.createModule(.{
+        .root_source_file = b.path("src/net/quic/quic.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    quic_module.addIncludePath(b.path("lib/msquic/build/native/include"));
+    quic_module.addLibraryPath(b.path("lib/msquic/build/native/lib/x64"));
+    quic_module.linkSystemLibrary("msquic", .{});
+
     // Main proxy executable
     const exe = b.addExecutable(.{
         .name = "zytale",
@@ -20,9 +30,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "protocol", .module = protocol_module },
+                .{ .name = "quic", .module = quic_module },
             },
         }),
     });
+
+    // Copy msquic.dll to output
+    const install_dll = b.addInstallBinFile(b.path("lib/msquic/build/native/bin/x64/msquic.dll"), "msquic.dll");
+    b.getInstallStep().dependOn(&install_dll.step);
 
     b.installArtifact(exe);
 
