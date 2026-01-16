@@ -4,6 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Protocol module (shared)
+    const protocol_module = b.createModule(.{
+        .root_source_file = b.path("src/protocol/registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Main proxy executable
     const exe = b.addExecutable(.{
         .name = "zytale",
@@ -11,6 +18,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "protocol", .module = protocol_module },
+            },
         }),
     });
 
@@ -28,12 +38,6 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // List packets tool
-    const protocol_module = b.createModule(.{
-        .root_source_file = b.path("src/protocol/registry.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     const list_packets_module = b.createModule(.{
         .root_source_file = b.path("src/tools/list_packets.zig"),
         .target = target,

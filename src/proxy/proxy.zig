@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const frame = @import("../net/packet/frame.zig");
+const registry = @import("protocol");
 
 const log = std.log.scoped(.proxy);
 
@@ -404,8 +405,10 @@ fn parseIpv4(host: []const u8) !u32 {
 }
 
 fn logPacket(direction: []const u8, packet_id: u32, payload: []const u8) void {
-    log.info("{s} ID={d} (0x{X:0>4}) len={d}", .{
+    const name = registry.getName(packet_id);
+    log.info("{s} [{s}] ID={d} (0x{X:0>4}) len={d}", .{
         direction,
+        name,
         packet_id,
         packet_id,
         payload.len,
