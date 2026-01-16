@@ -3,6 +3,9 @@ zig-out/
 zig-cache/
 .zig-cache/
 
+# Dependencies (download msquic from https://github.com/microsoft/msquic/releases)
+lib/
+
 # IDE
 .vscode/
 .idea/
@@ -10,3 +13,4 @@ zig-cache/
 # OS
 .DS_Store
 Thumbs.db
+CLAUDE.md

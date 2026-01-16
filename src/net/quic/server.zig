@@ -22,7 +22,7 @@ pub const QuicServer = struct {
             .registration = null,
             .configuration = null,
             .listener = null,
-            .alpn = "hytale",
+            .alpn = "hytale/1",
             .port = 0,
         };
     }
