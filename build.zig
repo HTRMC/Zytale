@@ -27,10 +27,37 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the proxy");
     run_step.dependOn(&run_cmd.step);
 
+    // List packets tool
+    const protocol_module = b.createModule(.{
+        .root_source_file = b.path("src/protocol/registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const list_packets_module = b.createModule(.{
+        .root_source_file = b.path("src/tools/list_packets.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "protocol", .module = protocol_module },
+        },
+    });
+
+    const list_packets = b.addExecutable(.{
+        .name = "list-packets",
+        .root_module = list_packets_module,
+    });
+
+    b.installArtifact(list_packets);
+
+    const list_packets_cmd = b.addRunArtifact(list_packets);
+    const list_packets_step = b.step("list-packets", "List all known Hytale packets");
+    list_packets_step.dependOn(&list_packets_cmd.step);
+
     // Unit tests
     const unit_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
+            .root_source_file = b.path("src/protocol/registry.zig"),
             .target = target,
             .optimize = optimize,
         }),
