@@ -11,6 +11,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Auth module
+    const auth_module = b.createModule(.{
+        .root_source_file = b.path("src/auth/auth.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // QUIC module with msquic
     const quic_module = b.createModule(.{
         .root_source_file = b.path("src/net/quic/quic.zig"),
@@ -31,6 +38,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "protocol", .module = protocol_module },
                 .{ .name = "quic", .module = quic_module },
+                .{ .name = "auth", .module = auth_module },
             },
         }),
     });
