@@ -6,6 +6,7 @@ const connectionCallback = @import("connection.zig").connectionCallback;
 const Stream = @import("stream.zig").Stream;
 const registry = @import("protocol");
 const auth = @import("../auth/auth.zig");
+const assets = @import("../assets/mod.zig");
 
 const log = std.log.scoped(.server);
 
@@ -60,6 +61,9 @@ pub const Server = struct {
     session_client: auth.SessionServiceClient,
     server_credentials: *auth.ServerCredentials,
 
+    // Asset registry for loading game assets
+    asset_registry: assets.AssetRegistry,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig, credentials: *auth.ServerCredentials) !Self {
@@ -78,6 +82,7 @@ pub const Server = struct {
             .running = false,
             .session_client = auth.SessionServiceClient.init(allocator),
             .server_credentials = credentials,
+            .asset_registry = assets.AssetRegistry.init(allocator),
         };
     }
 
@@ -116,6 +121,9 @@ pub const Server = struct {
 
         // Clean up session client
         self.session_client.deinit();
+
+        // Clean up asset registry
+        self.asset_registry.deinit();
     }
 
     /// Initialize MsQuic and configure the server
@@ -180,6 +188,18 @@ pub const Server = struct {
 
         // Load TLS credentials
         try self.loadCredentials();
+
+        // Load game assets
+        log.info("Loading game assets...", .{});
+        self.asset_registry.loadFromZip("HytaleServerSource/Assets.zip") catch |err| {
+            log.warn("Failed to load assets from ZIP: {} - using placeholders", .{err});
+            // Load placeholder assets if ZIP loading fails
+            self.asset_registry.loadPlaceholderAssets() catch |e| {
+                log.err("Failed to load placeholder assets: {}", .{e});
+                return e;
+            };
+        };
+        log.info("Loaded {d} assets", .{self.asset_registry.count()});
 
         log.info("Server setup complete", .{});
     }

@@ -31,8 +31,11 @@ pub const AssetStore = struct {
     /// Asset index (path -> info)
     assets_by_path: std.StringHashMap(AssetInfo),
 
-    /// File handle for the archive
-    archive_file: ?std.fs.File,
+    /// File handle for the archive (using new std.Io API)
+    archive_file: ?std.Io.File,
+
+    /// File size (cached for seeking)
+    file_size: u64,
 
     /// Whether the store is loaded
     loaded: bool,
@@ -46,13 +49,16 @@ pub const AssetStore = struct {
             .assets_by_hash = std.AutoHashMap([32]u8, AssetInfo).init(allocator),
             .assets_by_path = std.StringHashMap(AssetInfo).init(allocator),
             .archive_file = null,
+            .file_size = 0,
             .loaded = false,
         };
     }
 
     pub fn deinit(self: *Self) void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+
         if (self.archive_file) |file| {
-            file.close();
+            file.close(io);
         }
 
         // Free asset info paths
@@ -70,11 +76,22 @@ pub const AssetStore = struct {
     pub fn load(self: *Self) !void {
         log.info("Loading asset store from: {s}", .{self.archive_path});
 
-        // Open the archive file
-        self.archive_file = std.fs.openFileAbsolute(self.archive_path, .{}) catch |err| {
+        // Get Io instance
+        const io = std.Io.Threaded.global_single_threaded.io();
+
+        // Open the archive file using new std.Io API
+        self.archive_file = std.Io.Dir.openFile(.cwd(), io, self.archive_path, .{}) catch |err| {
             log.err("Failed to open asset archive: {}", .{err});
             return err;
         };
+
+        // Get file size
+        self.file_size = self.archive_file.?.length(io) catch |err| {
+            log.err("Failed to get file size: {}", .{err});
+            return err;
+        };
+
+        log.debug("Archive file size: {d} bytes", .{self.file_size});
 
         // Read ZIP central directory
         try self.readZipDirectory();
@@ -86,23 +103,36 @@ pub const AssetStore = struct {
     /// Read ZIP central directory to build asset index
     fn readZipDirectory(self: *Self) !void {
         const file = self.archive_file orelse return error.NotOpened;
+        const io = std.Io.Threaded.global_single_threaded.io();
 
-        // Find End of Central Directory record
-        // For simplicity, we scan from the end backwards
-        const file_size = try file.getEndPos();
-
-        if (file_size < 22) {
+        if (self.file_size < 22) {
             return error.InvalidZip;
         }
 
         // Read last 64KB or file size, whichever is smaller
-        const search_size: usize = @min(file_size, 65536);
-        try file.seekTo(file_size - search_size);
+        const search_size: usize = @min(self.file_size, 65536);
+        const search_offset: u64 = self.file_size - search_size;
 
         var search_buf = try self.allocator.alloc(u8, search_size);
         defer self.allocator.free(search_buf);
 
-        const bytes_read = try file.readAll(search_buf);
+        // Create reader with known file size for seeking
+        var read_buffer: [8192]u8 = undefined;
+        var reader = std.Io.File.Reader.initSize(file, io, &read_buffer, self.file_size);
+
+        // Seek to near end of file
+        reader.seekTo(search_offset) catch |err| {
+            log.err("Failed to seek for EOCD search: {}", .{err});
+            return err;
+        };
+
+        // Read search buffer
+        reader.interface.readSliceAll(search_buf) catch |err| {
+            log.err("Failed to read EOCD search buffer: {}", .{err});
+            return err;
+        };
+        const bytes_read = search_buf.len;
+
         if (bytes_read < 22) {
             return error.InvalidZip;
         }
@@ -134,18 +164,24 @@ pub const AssetStore = struct {
         log.debug("ZIP: {d} entries, CD at offset {d}, size {d}", .{ entry_count, cd_offset, cd_size });
 
         // Read central directory
-        try file.seekTo(cd_offset);
+        reader.seekTo(cd_offset) catch |err| {
+            log.err("Failed to seek to CD: {}", .{err});
+            return err;
+        };
 
         var cd_buf = try self.allocator.alloc(u8, cd_size);
         defer self.allocator.free(cd_buf);
 
-        _ = try file.readAll(cd_buf);
+        reader.interface.readSliceAll(cd_buf) catch |err| {
+            log.err("Failed to read CD: {}", .{err});
+            return err;
+        };
 
         // Parse central directory entries
         var offset: usize = 0;
-        var count: usize = 0;
+        var indexed_count: usize = 0;
 
-        while (offset + 46 <= cd_buf.len and count < entry_count) {
+        while (offset + 46 <= cd_buf.len and indexed_count < entry_count) {
             // Check signature
             if (cd_buf[offset] != 0x50 or cd_buf[offset + 1] != 0x4b or
                 cd_buf[offset + 2] != 0x01 or cd_buf[offset + 3] != 0x02)
@@ -191,10 +227,10 @@ pub const AssetStore = struct {
             }
 
             offset = filename_end + extra_len + comment_len;
-            count += 1;
+            indexed_count += 1;
         }
 
-        log.debug("Indexed {d} assets", .{count});
+        log.debug("Indexed {d} assets", .{indexed_count});
     }
 
     /// Get asset by SHA-256 hash
@@ -222,13 +258,18 @@ pub const AssetStore = struct {
     /// Read asset content from ZIP by local file header offset
     fn readAssetByOffset(self: *Self, offset: u64, size: u64) ![]u8 {
         const file = self.archive_file orelse return error.NotOpened;
+        const io = std.Io.Threaded.global_single_threaded.io();
+
+        // Create reader with known file size for seeking
+        var read_buffer: [8192]u8 = undefined;
+        var reader = std.Io.File.Reader.initSize(file, io, &read_buffer, self.file_size);
 
         // Seek to local file header
-        try file.seekTo(offset);
+        reader.seekTo(offset) catch return error.SeekFailed;
 
         // Read local file header
         var header: [30]u8 = undefined;
-        _ = try file.readAll(&header);
+        reader.interface.readSliceAll(&header) catch return error.ReadFailed;
 
         // Verify signature
         if (header[0] != 0x50 or header[1] != 0x4b or
@@ -241,14 +282,14 @@ pub const AssetStore = struct {
         const filename_len = std.mem.readInt(u16, header[26..28], .little);
         const extra_len = std.mem.readInt(u16, header[28..30], .little);
 
-        // Skip to data
-        try file.seekBy(filename_len + extra_len);
+        // Skip to data (seek relative)
+        reader.seekBy(@intCast(filename_len + extra_len)) catch return error.SeekFailed;
 
         // Read data
         const data = try self.allocator.alloc(u8, size);
         errdefer self.allocator.free(data);
 
-        _ = try file.readAll(data);
+        reader.interface.readSliceAll(data) catch return error.ReadFailed;
 
         return data;
     }
