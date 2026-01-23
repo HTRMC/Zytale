@@ -5,6 +5,7 @@ const Connection = @import("connection.zig").Connection;
 const connectionCallback = @import("connection.zig").connectionCallback;
 const Stream = @import("stream.zig").Stream;
 const registry = @import("protocol");
+const auth = @import("../auth/auth.zig");
 
 const log = std.log.scoped(.server);
 
@@ -55,9 +56,16 @@ pub const Server = struct {
     // Server state
     running: bool,
 
+    // Authentication components for Session Service integration
+    session_client: auth.SessionServiceClient,
+    server_credentials: auth.ServerCredentials,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !Self {
+        // Load server credentials from environment
+        const credentials = auth.ServerCredentials.fromEnvironment();
+
         return .{
             .allocator = allocator,
             .config = config,
@@ -71,6 +79,8 @@ pub const Server = struct {
             .next_client_id = 1,
             .mutex = .{},
             .running = false,
+            .session_client = auth.SessionServiceClient.init(allocator),
+            .server_credentials = credentials,
         };
     }
 
@@ -106,6 +116,9 @@ pub const Server = struct {
         if (self.cert) |*cert| {
             cert.deinit();
         }
+
+        // Clean up session client
+        self.session_client.deinit();
     }
 
     /// Initialize MsQuic and configure the server
@@ -325,6 +338,9 @@ pub const Server = struct {
         );
         conn.setServerContext(self);
         conn.remote_addr = remote.*;
+
+        // Pass auth context to connection for Session Service integration
+        conn.setAuthContext(&self.session_client, &self.server_credentials);
 
         // Register connection
         self.mutex.lock();

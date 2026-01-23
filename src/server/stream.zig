@@ -4,6 +4,7 @@ const frame = @import("../net/packet/frame.zig");
 const registry = @import("protocol");
 const serializer = @import("../protocol/packets/serializer.zig");
 const zstd = @import("../net/compression/zstd.zig");
+const auth = @import("../auth/auth.zig");
 
 const log = std.log.scoped(.stream);
 
@@ -13,6 +14,7 @@ const EXPECTED_PROTOCOL_HASH = "6708f121966c1c443f4b0eb525b2f81d0a8dc61f5003a692
 /// Connection phase for the protocol state machine
 pub const ConnectionPhase = enum {
     initial, // Waiting for Connect packet
+    awaiting_auth, // Sent AuthGrant, waiting for AuthToken (authenticated mode)
     password, // Waiting for PasswordResponse (if password required)
     setup, // Setup phase: sent WorldSettings, waiting for RequestAssets
     loading, // Sending assets and world data
@@ -45,6 +47,13 @@ pub const Stream = struct {
     player_uuid: ?[16]u8,
     username: ?[]const u8,
 
+    // Authentication context (optional - may be null if server has no credentials)
+    session_client: ?*auth.SessionServiceClient,
+    server_credentials: ?*const auth.ServerCredentials,
+
+    // Store client's identity token for auth exchange
+    client_identity_token: ?[]const u8,
+
     const Self = @This();
 
     pub fn init(
@@ -63,7 +72,20 @@ pub const Stream = struct {
             .phase = .initial,
             .player_uuid = null,
             .username = null,
+            .session_client = null,
+            .server_credentials = null,
+            .client_identity_token = null,
         };
+    }
+
+    /// Set authentication context for Session Service integration
+    pub fn setAuthContext(
+        self: *Self,
+        session_client: ?*auth.SessionServiceClient,
+        server_credentials: ?*const auth.ServerCredentials,
+    ) void {
+        self.session_client = session_client;
+        self.server_credentials = server_credentials;
     }
 
     pub fn deinit(self: *Self) void {
@@ -78,6 +100,9 @@ pub const Stream = struct {
         self.send_buffer.deinit(self.allocator);
         if (self.username) |name| {
             self.allocator.free(name);
+        }
+        if (self.client_identity_token) |token| {
+            self.allocator.free(token);
         }
     }
 
@@ -113,6 +138,7 @@ pub const Stream = struct {
         // Route packet to handler based on ID
         switch (pkt.id) {
             registry.Connect.id => self.handleConnect(pkt.payload),
+            registry.AuthToken.id => self.handleAuthToken(pkt.payload),
             registry.Disconnect.id => self.handleDisconnect(pkt.payload),
             registry.PasswordResponse.id => self.handlePasswordResponse(pkt.payload),
             registry.RequestAssets.id => self.handleRequestAssets(pkt.payload),
@@ -167,12 +193,55 @@ pub const Stream = struct {
         self.username = self.allocator.dupe(u8, connect.username) catch null;
 
         // Check for identity token (authenticated mode)
-        if (connect.identity_token != null) {
-            log.info("Client has identity token - authenticated mode not yet supported", .{});
-            // For now, treat as development mode
+        if (connect.identity_token) |client_identity_token| {
+            log.info("Client has identity token - using authenticated handshake", .{});
+
+            // Check if we have server credentials for real authentication
+            const creds = self.server_credentials;
+            const client = self.session_client;
+
+            if (creds != null and creds.?.isValid() and client != null) {
+                // Real authentication: call Session Service for auth grant
+                log.info("Calling Session Service for auth grant...", .{});
+
+                // Store client's identity token for later use
+                self.client_identity_token = self.allocator.dupe(u8, client_identity_token) catch null;
+
+                const auth_grant = client.?.requestAuthGrant(
+                    client_identity_token,
+                    creds.?.audience,
+                    creds.?.session_token.?,
+                ) catch |err| {
+                    log.err("Failed to get auth grant from Session Service: {}", .{err});
+                    self.sendDisconnect("Authentication failed - Session Service error") catch {};
+                    return;
+                };
+                defer self.allocator.free(auth_grant);
+
+                // Send AuthGrant with real tokens
+                self.sendAuthGrant(auth_grant, creds.?.identity_token) catch |err| {
+                    log.err("Failed to send AuthGrant: {}", .{err});
+                    return;
+                };
+            } else {
+                // No server credentials - send AuthGrant with null values
+                // This will likely fail on the client side, but allows testing
+                log.warn("Server credentials not configured - sending empty AuthGrant", .{});
+                log.warn("Set HYTALE_SERVER_SESSION_TOKEN and HYTALE_SERVER_IDENTITY_TOKEN for real auth", .{});
+
+                self.sendAuthGrant(null, null) catch |err| {
+                    log.err("Failed to send AuthGrant: {}", .{err});
+                    return;
+                };
+            }
+
+            self.phase = .awaiting_auth;
+            return;
         }
 
-        // Development mode: send ConnectAccept with no password
+        // Development mode (no identity token): send ConnectAccept with no password
+        // Note: Real Hytale client will reject this as "development mode not supported"
+        log.info("Client has no identity token - using development mode", .{});
         log.info("Sending ConnectAccept (no password)", .{});
         self.sendConnectAccept(null) catch |err| {
             log.err("Failed to send ConnectAccept: {}", .{err});
@@ -190,6 +259,84 @@ pub const Stream = struct {
         _ = payload;
         log.info("Client sent Disconnect", .{});
         self.shutdown();
+    }
+
+    fn handleAuthToken(self: *Self, payload: []const u8) void {
+        if (self.phase != .awaiting_auth) {
+            log.warn("Received AuthToken in wrong phase: {s}", .{@tagName(self.phase)});
+            return;
+        }
+
+        const auth_token = serializer.AuthTokenPacket.parse(payload) orelse {
+            log.err("Failed to parse AuthToken packet", .{});
+            self.sendDisconnect("Protocol error: invalid AuthToken") catch {};
+            return;
+        };
+
+        // Log what we received
+        if (auth_token.access_token) |token| {
+            log.info("Received AuthToken with access_token len={d}", .{token.len});
+        } else {
+            log.info("Received AuthToken with no access_token", .{});
+        }
+        if (auth_token.server_authorization_grant) |grant| {
+            log.info("AuthToken has server_authorization_grant len={d}", .{grant.len});
+        }
+
+        // Check if we have server credentials for real authentication
+        const creds = self.server_credentials;
+        const client = self.session_client;
+
+        if (creds != null and creds.?.isValid() and client != null) {
+            // Real authentication: exchange auth grant for server access token
+            if (auth_token.server_authorization_grant) |server_auth_grant| {
+                log.info("Exchanging auth grant for server access token...", .{});
+
+                // Get certificate fingerprint (required for exchange)
+                const cert_fp = creds.?.cert_fingerprint orelse {
+                    log.err("Server certificate fingerprint not configured", .{});
+                    self.sendDisconnect("Server misconfigured - missing certificate fingerprint") catch {};
+                    return;
+                };
+
+                const server_access_token = client.?.exchangeAuthGrant(
+                    server_auth_grant,
+                    cert_fp,
+                    creds.?.session_token.?,
+                ) catch |err| {
+                    log.err("Failed to exchange auth grant: {}", .{err});
+                    self.sendDisconnect("Authentication failed - token exchange error") catch {};
+                    return;
+                };
+                defer self.allocator.free(server_access_token);
+
+                // Send ServerAuthToken with real access token, no password challenge
+                self.sendServerAuthToken(server_access_token, null) catch |err| {
+                    log.err("Failed to send ServerAuthToken: {}", .{err});
+                    return;
+                };
+            } else {
+                log.warn("AuthToken missing server_authorization_grant - sending empty ServerAuthToken", .{});
+                self.sendServerAuthToken(null, null) catch |err| {
+                    log.err("Failed to send ServerAuthToken: {}", .{err});
+                    return;
+                };
+            }
+        } else {
+            // No server credentials - send ServerAuthToken with null values
+            // From Java: PasswordPacketHandler.java:66-67 - if passwordChallenge == null, proceeds to setup
+            log.warn("No server credentials - sending empty ServerAuthToken", .{});
+            self.sendServerAuthToken(null, null) catch |err| {
+                log.err("Failed to send ServerAuthToken: {}", .{err});
+                return;
+            };
+        }
+
+        // Proceed to setup phase
+        self.phase = .setup;
+        self.beginSetupPhase() catch |err| {
+            log.err("Failed to begin setup phase: {}", .{err});
+        };
     }
 
     fn handlePasswordResponse(self: *Self, payload: []const u8) void {
@@ -286,6 +433,20 @@ pub const Stream = struct {
         defer self.allocator.free(payload);
         try self.sendPacket(registry.ConnectAccept.id, payload);
         log.info("Sent ConnectAccept", .{});
+    }
+
+    fn sendAuthGrant(self: *Self, auth_grant: ?[]const u8, server_identity_token: ?[]const u8) !void {
+        const payload = try serializer.serializeAuthGrant(self.allocator, auth_grant, server_identity_token);
+        defer self.allocator.free(payload);
+        try self.sendPacket(registry.AuthGrant.id, payload);
+        log.info("Sent AuthGrant", .{});
+    }
+
+    fn sendServerAuthToken(self: *Self, server_access_token: ?[]const u8, password_challenge: ?[]const u8) !void {
+        const payload = try serializer.serializeServerAuthToken(self.allocator, server_access_token, password_challenge);
+        defer self.allocator.free(payload);
+        try self.sendPacket(registry.ServerAuthToken.id, payload);
+        log.info("Sent ServerAuthToken", .{});
     }
 
     fn sendPasswordAccepted(self: *Self) !void {

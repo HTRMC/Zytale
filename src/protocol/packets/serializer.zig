@@ -365,6 +365,141 @@ test "parse Connect packet" {
     try std.testing.expectEqualStrings("Test", result.?.username);
 }
 
+/// Serialize AuthGrant packet (ID=11) - Server → Client
+/// Format: nullBits(1) + authGrantOffset(4) + serverIdTokenOffset(4) + variable
+/// Both fields are optional VarString
+pub fn serializeAuthGrant(allocator: std.mem.Allocator, auth_grant: ?[]const u8, server_identity_token: ?[]const u8) ![]u8 {
+    var null_bits: u8 = 0;
+    var var_data: std.ArrayListUnmanaged(u8) = .empty;
+    defer var_data.deinit(allocator);
+
+    var auth_grant_offset: i32 = -1;
+    var server_id_token_offset: i32 = -1;
+
+    // Write auth_grant if present
+    if (auth_grant) |grant| {
+        null_bits |= 0x01;
+        auth_grant_offset = @intCast(var_data.items.len);
+        var vi_buf: [5]u8 = undefined;
+        const vi_len = writeVarInt(&vi_buf, @intCast(grant.len));
+        try var_data.appendSlice(allocator, vi_buf[0..vi_len]);
+        try var_data.appendSlice(allocator, grant);
+    }
+
+    // Write server_identity_token if present
+    if (server_identity_token) |token| {
+        null_bits |= 0x02;
+        server_id_token_offset = @intCast(var_data.items.len);
+        var vi_buf: [5]u8 = undefined;
+        const vi_len = writeVarInt(&vi_buf, @intCast(token.len));
+        try var_data.appendSlice(allocator, vi_buf[0..vi_len]);
+        try var_data.appendSlice(allocator, token);
+    }
+
+    // Fixed block: nullBits(1) + authGrantOffset(4) + serverIdTokenOffset(4) = 9
+    const fixed_size: usize = 9;
+    const total_size = fixed_size + var_data.items.len;
+    const buf = try allocator.alloc(u8, total_size);
+
+    buf[0] = null_bits;
+    std.mem.writeInt(i32, buf[1..5], auth_grant_offset, .little);
+    std.mem.writeInt(i32, buf[5..9], server_id_token_offset, .little);
+
+    // Write variable data
+    @memcpy(buf[fixed_size..], var_data.items);
+
+    return buf;
+}
+
+/// Serialize ServerAuthToken packet (ID=13) - Server → Client
+/// Format: nullBits(1) + accessTokenOffset(4) + passwordChallengeOffset(4) + variable
+/// Both fields are optional VarString
+pub fn serializeServerAuthToken(allocator: std.mem.Allocator, server_access_token: ?[]const u8, password_challenge: ?[]const u8) ![]u8 {
+    var null_bits: u8 = 0;
+    var var_data: std.ArrayListUnmanaged(u8) = .empty;
+    defer var_data.deinit(allocator);
+
+    var access_token_offset: i32 = -1;
+    var password_challenge_offset: i32 = -1;
+
+    // Write server_access_token if present
+    if (server_access_token) |token| {
+        null_bits |= 0x01;
+        access_token_offset = @intCast(var_data.items.len);
+        var vi_buf: [5]u8 = undefined;
+        const vi_len = writeVarInt(&vi_buf, @intCast(token.len));
+        try var_data.appendSlice(allocator, vi_buf[0..vi_len]);
+        try var_data.appendSlice(allocator, token);
+    }
+
+    // Write password_challenge if present
+    if (password_challenge) |challenge| {
+        null_bits |= 0x02;
+        password_challenge_offset = @intCast(var_data.items.len);
+        var vi_buf: [5]u8 = undefined;
+        const vi_len = writeVarInt(&vi_buf, @intCast(challenge.len));
+        try var_data.appendSlice(allocator, vi_buf[0..vi_len]);
+        try var_data.appendSlice(allocator, challenge);
+    }
+
+    // Fixed block: nullBits(1) + accessTokenOffset(4) + passwordChallengeOffset(4) = 9
+    const fixed_size: usize = 9;
+    const total_size = fixed_size + var_data.items.len;
+    const buf = try allocator.alloc(u8, total_size);
+
+    buf[0] = null_bits;
+    std.mem.writeInt(i32, buf[1..5], access_token_offset, .little);
+    std.mem.writeInt(i32, buf[5..9], password_challenge_offset, .little);
+
+    // Write variable data
+    @memcpy(buf[fixed_size..], var_data.items);
+
+    return buf;
+}
+
+/// Parse AuthToken packet (ID=12) - Client → Server
+/// Format: nullBits(1) + accessTokenOffset(4) + serverAuthGrantOffset(4) + variable
+pub const AuthTokenPacket = struct {
+    access_token: ?[]const u8,
+    server_authorization_grant: ?[]const u8,
+
+    pub fn parse(data: []const u8) ?AuthTokenPacket {
+        // Minimum size: nullBits(1) + 2 offsets (4 each) = 9 bytes
+        if (data.len < 9) return null;
+
+        const null_bits = data[0];
+        const access_token_offset = std.mem.readInt(i32, data[1..5], .little);
+        const server_auth_grant_offset = std.mem.readInt(i32, data[5..9], .little);
+
+        const var_block_start: usize = 9;
+
+        // Parse optional access_token (bit 0)
+        var access_token: ?[]const u8 = null;
+        if ((null_bits & 0x01) != 0 and access_token_offset >= 0) {
+            const pos = var_block_start + @as(usize, @intCast(access_token_offset));
+            if (pos < data.len) {
+                const vs = readVarString(data[pos..]) orelse return null;
+                access_token = vs.value;
+            }
+        }
+
+        // Parse optional server_authorization_grant (bit 1)
+        var server_auth_grant: ?[]const u8 = null;
+        if ((null_bits & 0x02) != 0 and server_auth_grant_offset >= 0) {
+            const pos = var_block_start + @as(usize, @intCast(server_auth_grant_offset));
+            if (pos < data.len) {
+                const vs = readVarString(data[pos..]) orelse return null;
+                server_auth_grant = vs.value;
+            }
+        }
+
+        return AuthTokenPacket{
+            .access_token = access_token,
+            .server_authorization_grant = server_auth_grant,
+        };
+    }
+};
+
 test "serialize ConnectAccept" {
     const allocator = std.testing.allocator;
 
@@ -380,4 +515,42 @@ test "serialize ConnectAccept" {
     defer allocator.free(with_pw);
     try std.testing.expectEqual(@as(usize, 6), with_pw.len); // 1 + 1 + 4
     try std.testing.expectEqual(@as(u8, 1), with_pw[0]); // nullBits
+}
+
+test "serialize AuthGrant" {
+    const allocator = std.testing.allocator;
+
+    // Without any optional fields
+    const no_fields = try serializeAuthGrant(allocator, null, null);
+    defer allocator.free(no_fields);
+    try std.testing.expectEqual(@as(usize, 9), no_fields.len);
+    try std.testing.expectEqual(@as(u8, 0), no_fields[0]); // nullBits
+
+    // With auth_grant only
+    const with_grant = try serializeAuthGrant(allocator, "test_grant", null);
+    defer allocator.free(with_grant);
+    try std.testing.expectEqual(@as(u8, 1), with_grant[0]); // nullBits: bit 0 set
+}
+
+test "serialize ServerAuthToken" {
+    const allocator = std.testing.allocator;
+
+    // Without any optional fields
+    const no_fields = try serializeServerAuthToken(allocator, null, null);
+    defer allocator.free(no_fields);
+    try std.testing.expectEqual(@as(usize, 9), no_fields.len);
+    try std.testing.expectEqual(@as(u8, 0), no_fields[0]); // nullBits
+}
+
+test "parse AuthToken" {
+    // Build minimal AuthToken packet (no optional fields)
+    var data: [9]u8 = undefined;
+    data[0] = 0x00; // nullBits: no optional fields
+    std.mem.writeInt(i32, data[1..5], -1, .little); // access_token_offset
+    std.mem.writeInt(i32, data[5..9], -1, .little); // server_auth_grant_offset
+
+    const result = AuthTokenPacket.parse(&data);
+    try std.testing.expect(result != null);
+    try std.testing.expect(result.?.access_token == null);
+    try std.testing.expect(result.?.server_authorization_grant == null);
 }

@@ -4,6 +4,7 @@ const Stream = @import("stream.zig").Stream;
 const streamCallback = @import("stream.zig").streamCallback;
 const frame = @import("../net/packet/frame.zig");
 const registry = @import("protocol");
+const auth = @import("../auth/auth.zig");
 
 const log = std.log.scoped(.connection);
 
@@ -50,6 +51,10 @@ pub const Connection = struct {
     // Server reference for callbacks
     server_context: ?*anyopaque,
 
+    // Authentication context for Session Service integration
+    session_client: ?*auth.SessionServiceClient,
+    server_credentials: ?*const auth.ServerCredentials,
+
     const Self = @This();
 
     pub fn init(
@@ -72,7 +77,19 @@ pub const Connection = struct {
             .player_uuid = null,
             .username = null,
             .server_context = null,
+            .session_client = null,
+            .server_credentials = null,
         };
+    }
+
+    /// Set authentication context for Session Service integration
+    pub fn setAuthContext(
+        self: *Self,
+        session_client: ?*auth.SessionServiceClient,
+        server_credentials: ?*const auth.ServerCredentials,
+    ) void {
+        self.session_client = session_client;
+        self.server_credentials = server_credentials;
     }
 
     pub fn deinit(self: *Self) void {
@@ -109,6 +126,9 @@ pub const Connection = struct {
         const stream = try self.allocator.create(Stream);
         stream.* = Stream.init(self.allocator, stream_handle, self.api);
         stream.setConnectionContext(self);
+
+        // Pass auth context to stream for Session Service integration
+        stream.setAuthContext(self.session_client, self.server_credentials);
 
         // Set the callback handler
         self.api.set_callback_handler(stream_handle, @ptrCast(@constCast(&streamCallback)), stream);
