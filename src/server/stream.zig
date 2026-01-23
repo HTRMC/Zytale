@@ -19,6 +19,7 @@ pub const ConnectionPhase = enum {
 };
 
 /// Pending send buffer awaiting SEND_COMPLETE callback from MsQuic
+/// Heap-allocated so pointers remain stable when other entries are removed
 const PendingSend = struct {
     buffer: []u8,
     quic_buffer: msquic.QUIC_BUFFER,
@@ -35,7 +36,8 @@ pub const Stream = struct {
     send_buffer: std.ArrayList(u8),
 
     // Track buffers until MsQuic SEND_COMPLETE callback
-    pending_sends: std.ArrayListUnmanaged(PendingSend),
+    // Store pointers to heap-allocated PendingSend so addresses stay stable
+    pending_sends: std.ArrayListUnmanaged(*PendingSend),
 
     // Protocol state
     phase: ConnectionPhase,
@@ -67,6 +69,7 @@ pub const Stream = struct {
         // Free any remaining pending send buffers
         for (self.pending_sends.items) |pending| {
             self.allocator.free(pending.buffer);
+            self.allocator.destroy(pending);
         }
         self.pending_sends.deinit(self.allocator);
 
@@ -344,16 +347,25 @@ pub const Stream = struct {
     pub fn sendPacket(self: *Self, packet_id: u32, payload: []const u8) !void {
         const encoded = try frame.encodeFrame(self.allocator, packet_id, payload);
 
-        // Create pending send entry - buffer stays alive until SEND_COMPLETE
-        try self.pending_sends.append(self.allocator, .{
+        // Allocate PendingSend on heap so pointer remains stable
+        const pending = self.allocator.create(PendingSend) catch |err| {
+            self.allocator.free(encoded);
+            return err;
+        };
+        pending.* = .{
             .buffer = encoded,
             .quic_buffer = .{
                 .length = @intCast(encoded.len),
                 .buffer = encoded.ptr,
             },
-        });
+        };
 
-        const pending = &self.pending_sends.items[self.pending_sends.items.len - 1];
+        // Track it in our list
+        self.pending_sends.append(self.allocator, pending) catch |err| {
+            self.allocator.free(encoded);
+            self.allocator.destroy(pending);
+            return err;
+        };
 
         // Pass pointer to pending entry as client_context - returned in SEND_COMPLETE
         const status = self.api.stream_send(
@@ -365,9 +377,10 @@ pub const Stream = struct {
         );
 
         if (msquic.QUIC_FAILED(status)) {
-            // Failed immediately - clean up the buffer we just added
+            // Failed immediately - clean up
             _ = self.pending_sends.pop();
             self.allocator.free(encoded);
+            self.allocator.destroy(pending);
             log.err("Stream send failed: 0x{X:0>8}", .{status});
             return error.SendFailed;
         }
@@ -454,12 +467,15 @@ pub fn streamCallback(
                 stream.allocator.free(pending.buffer);
 
                 // Remove from pending list by finding and swap-removing
-                for (stream.pending_sends.items, 0..) |*item, i| {
+                for (stream.pending_sends.items, 0..) |item, i| {
                     if (item == pending) {
                         _ = stream.pending_sends.swapRemove(i);
                         break;
                     }
                 }
+
+                // Free the PendingSend struct itself
+                stream.allocator.destroy(pending);
 
                 log.debug("SEND_COMPLETE: freed buffer, {d} pending remain", .{stream.pending_sends.items.len});
             }
