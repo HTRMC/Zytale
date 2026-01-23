@@ -58,14 +58,11 @@ pub const Server = struct {
 
     // Authentication components for Session Service integration
     session_client: auth.SessionServiceClient,
-    server_credentials: auth.ServerCredentials,
+    server_credentials: *auth.ServerCredentials,
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, config: ServerConfig) !Self {
-        // Load server credentials from environment
-        const credentials = auth.ServerCredentials.fromEnvironment();
-
+    pub fn init(allocator: std.mem.Allocator, config: ServerConfig, credentials: *auth.ServerCredentials) !Self {
         return .{
             .allocator = allocator,
             .config = config,
@@ -231,6 +228,19 @@ pub const Server = struct {
 
             cred_config.type = .CONTEXT;
             cred_config.certificate.context = @ptrCast(@constCast(self.cert.?.context));
+
+            // Compute and store certificate fingerprint for Session Service auth
+            if (self.server_credentials.cert_fingerprint == null) {
+                const fingerprint = wincrypt.computeCertFingerprint(
+                    self.allocator,
+                    self.cert.?.context,
+                ) catch |err| {
+                    log.err("Failed to compute certificate fingerprint: {}", .{err});
+                    return error.FingerprintComputationFailed;
+                };
+                self.server_credentials.cert_fingerprint = fingerprint;
+                log.info("Computed certificate fingerprint: {s}", .{fingerprint});
+            }
         }
 
         const status = api.configuration_load_credential(self.configuration, &cred_config);
@@ -340,7 +350,7 @@ pub const Server = struct {
         conn.remote_addr = remote.*;
 
         // Pass auth context to connection for Session Service integration
-        conn.setAuthContext(&self.session_client, &self.server_credentials);
+        conn.setAuthContext(&self.session_client, self.server_credentials);
 
         // Register connection
         self.mutex.lock();
@@ -429,8 +439,8 @@ fn listenerCallback(
 }
 
 /// Run the server (blocking)
-pub fn runServer(allocator: std.mem.Allocator, config: ServerConfig) !void {
-    var server = try Server.init(allocator, config);
+pub fn runServer(allocator: std.mem.Allocator, config: ServerConfig, credentials: *auth.ServerCredentials) !void {
+    var server = try Server.init(allocator, config, credentials);
     defer server.deinit();
 
     try server.setup();

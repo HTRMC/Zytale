@@ -373,6 +373,54 @@ pub fn generateSelfSignedCert(allocator: std.mem.Allocator, config: CertConfig) 
     return cert;
 }
 
+/// Compute SHA-256 fingerprint of certificate as Base64 URL-safe string (no padding)
+/// This matches the Java implementation in CertificateUtil.java
+pub fn computeCertFingerprint(allocator: std.mem.Allocator, context: PCCERT_CONTEXT) ![]u8 {
+    const ctx = context orelse return error.NullCertificate;
+
+    // Get DER-encoded certificate bytes from CERT_CONTEXT
+    const cert_bytes = ctx.encoded_cert orelse return error.NoCertData;
+    const cert_len = ctx.encoded_cert_len;
+
+    if (cert_len == 0) return error.NoCertData;
+
+    // Compute SHA-256 hash
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(cert_bytes[0..cert_len], &hash, .{});
+
+    // Base64 encode (32 bytes → 44 chars with padding)
+    const encoded_len = std.base64.standard.Encoder.calcSize(32);
+    var encoded = try allocator.alloc(u8, encoded_len);
+
+    _ = std.base64.standard.Encoder.encode(encoded, &hash);
+
+    // Convert to URL-safe Base64 (in-place): + → -, / → _
+    for (encoded) |*c| {
+        if (c.* == '+') {
+            c.* = '-';
+        } else if (c.* == '/') {
+            c.* = '_';
+        }
+    }
+
+    // Remove padding ('=' at end) - shrink to actual length
+    var final_len = encoded_len;
+    while (final_len > 0 and encoded[final_len - 1] == '=') {
+        final_len -= 1;
+    }
+
+    // Reallocate to exact size
+    if (final_len < encoded_len) {
+        const result = allocator.realloc(encoded, final_len) catch {
+            // If realloc fails, just return the padded version truncated
+            return encoded[0..final_len];
+        };
+        return result;
+    }
+
+    return encoded;
+}
+
 test "generate self-signed certificate" {
     // This test only runs on Windows
     if (@import("builtin").os.tag != .windows) {
