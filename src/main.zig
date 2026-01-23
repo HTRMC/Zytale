@@ -2,6 +2,7 @@ const std = @import("std");
 const proxy = @import("proxy/proxy.zig");
 const server = @import("server/server.zig");
 const auth = @import("auth/auth.zig");
+const Console = @import("server/console.zig").Console;
 const World = @import("world/world.zig").World;
 
 /// Run mode
@@ -61,19 +62,35 @@ fn runServer(allocator: std.mem.Allocator) !void {
         \\
     , .{port});
 
-    // Check server credentials for authenticated handshake
-    const server_creds = auth.ServerCredentials.fromEnvironment();
+    // Load server credentials (env vars -> disk -> none)
+    var server_creds = auth.ServerCredentials.fromEnvironmentOrDisk(allocator);
     server_creds.logStatus();
     std.debug.print("\n", .{});
 
     // Initialize authentication
-    var auth_manager = auth.AuthManager.init(allocator, "zytale-server");
+    var auth_manager = auth.AuthManager.init(allocator, auth.DEFAULT_CLIENT_ID, &server_creds);
     defer auth_manager.deinit();
 
-    // For local testing, create a local session without OAuth
-    try auth_manager.createLocalSession("ServerHost");
+    // Start console thread for commands
+    var console = Console.init(allocator, &auth_manager, &server_creds);
+    defer console.deinit();
+    try console.start();
 
-    std.debug.print("  Auth: Local session created\n", .{});
+    // If we have valid credentials from disk, mark as authenticated
+    if (server_creds.isValid()) {
+        std.debug.print("  Auth: Loaded credentials for {s}\n", .{server_creds.username orelse "unknown"});
+    } else if (server_creds.refresh_token != null) {
+        // Try to refresh expired tokens
+        std.debug.print("  Auth: Attempting to refresh expired tokens...\n", .{});
+        auth_manager.refreshCredentials() catch |err| {
+            std.debug.print("  Auth: Token refresh failed: {}. Use /auth login device\n", .{err});
+        };
+    } else {
+        // No credentials, create local session for development
+        std.debug.print("  Auth: No credentials found. Creating local session for development.\n", .{});
+        std.debug.print("        Use /auth login device for authenticated mode.\n", .{});
+        try auth_manager.createLocalSession("ServerHost");
+    }
 
     // Initialize world
     var world = try World.init(allocator, "Flat World");
@@ -107,6 +124,7 @@ fn runServer(allocator: std.mem.Allocator) !void {
     std.debug.print("\n  Starting QUIC server on port {d}...\n", .{port});
     std.debug.print("  NOTE: MsQuic DLL must be installed for server mode.\n", .{});
     std.debug.print("  Download from: https://github.com/microsoft/msquic/releases\n\n", .{});
+    std.debug.print("  Type /help for available commands.\n\n", .{});
 
     server.runServer(allocator, config) catch |err| {
         std.debug.print("  Server error: {}\n", .{err});
