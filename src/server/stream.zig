@@ -3,6 +3,7 @@ const msquic = @import("msquic.zig");
 const frame = @import("../net/packet/frame.zig");
 const registry = @import("protocol");
 const serializer = @import("../protocol/packets/serializer.zig");
+const zstd = @import("../net/compression/zstd.zig");
 
 const log = std.log.scoped(.stream);
 
@@ -344,8 +345,30 @@ pub const Stream = struct {
 
     /// Send a packet to the client
     /// Buffer lifetime: the encoded frame is kept alive until MsQuic fires SEND_COMPLETE
+    /// Automatically compresses packets that have compressed=true in the registry
     pub fn sendPacket(self: *Self, packet_id: u32, payload: []const u8) !void {
-        const encoded = try frame.encodeFrame(self.allocator, packet_id, payload);
+        // Check if this packet type requires compression
+        const packet_info = registry.getById(packet_id);
+        const should_compress = packet_info != null and packet_info.?.compressed;
+
+        // Compress payload if needed
+        const final_payload: []u8 = if (should_compress) blk: {
+            const compressed = zstd.compress(self.allocator, payload) catch |err| {
+                log.err("Failed to compress packet {d}: {}", .{ packet_id, err });
+                return error.CompressionFailed;
+            };
+            log.debug("Compressed packet {d}: {d} -> {d} bytes", .{ packet_id, payload.len, compressed.len });
+            break :blk compressed;
+        } else blk: {
+            // For uncompressed packets, dupe the payload since we manage its lifetime
+            break :blk try self.allocator.dupe(u8, payload);
+        };
+
+        const encoded = frame.encodeFrame(self.allocator, packet_id, final_payload) catch |err| {
+            self.allocator.free(final_payload);
+            return err;
+        };
+        self.allocator.free(final_payload); // Free the (possibly compressed) payload copy
 
         // Allocate PendingSend on heap so pointer remains stable
         const pending = self.allocator.create(PendingSend) catch |err| {
@@ -386,7 +409,8 @@ pub const Stream = struct {
         }
 
         const name = registry.getName(packet_id);
-        log.info("Sent [{s}] ID={d} len={d}", .{ name, packet_id, payload.len });
+        const compress_str: []const u8 = if (should_compress) " (compressed)" else "";
+        log.info("Sent [{s}] ID={d} len={d}{s}", .{ name, packet_id, payload.len, compress_str });
         // DON'T free here - wait for SEND_COMPLETE callback
     }
 
