@@ -1,9 +1,27 @@
 /// Server Credentials Manager
-/// Loads server authentication credentials from environment variables
+/// Loads server authentication credentials from environment variables or disk
 const std = @import("std");
 const builtin = @import("builtin");
 
+const CredentialStore = @import("credential_store.zig").CredentialStore;
+const StoredCredentials = @import("credential_store.zig").StoredCredentials;
+
 const log = std.log.scoped(.server_credentials);
+
+/// Get current Unix timestamp using std.Io
+fn getTimestamp() i64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ts = std.Io.Clock.real.now(io) catch return 0;
+    return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s));
+}
+
+/// Source of credentials
+pub const CredentialSource = enum {
+    none,
+    environment,
+    disk,
+    device_flow,
+};
 
 /// Server credentials required for authenticated handshake with Session Service
 pub const ServerCredentials = struct {
@@ -24,15 +42,32 @@ pub const ServerCredentials = struct {
     /// Defaults to "hytale-game-server"
     audience: []const u8,
 
+    /// Authenticated username (if available)
+    username: ?[]const u8,
+
+    /// OAuth access token (for API calls)
+    access_token: ?[]const u8,
+
+    /// OAuth refresh token (for token renewal)
+    refresh_token: ?[]const u8,
+
+    /// Token expiration timestamp
+    expires_at: i64,
+
+    /// Source of credentials
+    source: CredentialSource,
+
     const Self = @This();
 
-    /// Load credentials from environment variables
+    /// Load credentials from environment variables only
     /// Note: The returned credential pointers are only valid for the lifetime of the process
     pub fn fromEnvironment() Self {
         const session_token = getEnvVar("HYTALE_SERVER_SESSION_TOKEN");
         const identity_token = getEnvVar("HYTALE_SERVER_IDENTITY_TOKEN");
         const cert_fingerprint = getEnvVar("HYTALE_SERVER_CERT_FINGERPRINT");
         const audience = getEnvVar("HYTALE_SERVER_AUDIENCE") orelse "hytale-game-server";
+
+        const has_tokens = session_token != null and identity_token != null;
 
         if (session_token != null) {
             log.info("Loaded session token from environment", .{});
@@ -49,7 +84,99 @@ pub const ServerCredentials = struct {
             .identity_token = identity_token,
             .cert_fingerprint = cert_fingerprint,
             .audience = audience,
+            .username = null,
+            .access_token = null,
+            .refresh_token = null,
+            .expires_at = 0,
+            .source = if (has_tokens) .environment else .none,
         };
+    }
+
+    /// Load credentials from environment variables, falling back to disk
+    /// Priority: Environment variables > Disk storage
+    pub fn fromEnvironmentOrDisk(allocator: std.mem.Allocator) Self {
+        // First try environment variables
+        var creds = fromEnvironment();
+        if (creds.isValid()) {
+            return creds;
+        }
+
+        // Fall back to disk storage
+        var store = CredentialStore.init(allocator);
+        defer store.deinit();
+
+        if (store.load()) |stored| {
+            log.info("Loading credentials from disk", .{});
+
+            // Copy stored credentials
+            creds.session_token = stored.session_token;
+            creds.identity_token = stored.identity_token;
+            creds.access_token = stored.access_token;
+            creds.refresh_token = stored.refresh_token;
+            creds.expires_at = stored.expires_at;
+            creds.source = .disk;
+
+            // Username is stored separately
+            if (stored.username) |name| {
+                creds.username = name;
+            }
+
+            if (creds.isValid()) {
+                log.info("Loaded valid credentials from disk for: {s}", .{creds.username orelse "unknown"});
+            } else if (stored.canRefresh()) {
+                log.info("Loaded expired credentials from disk (refresh available)", .{});
+            } else {
+                log.info("Loaded invalid credentials from disk", .{});
+            }
+
+            // Note: We don't free stored credentials here because creds now owns the pointers
+            // The caller is responsible for managing the lifetime
+            return creds;
+        }
+
+        log.info("No stored credentials found", .{});
+        return creds;
+    }
+
+    /// Create empty credentials
+    pub fn empty() Self {
+        return .{
+            .session_token = null,
+            .identity_token = null,
+            .cert_fingerprint = null,
+            .audience = "hytale-game-server",
+            .username = null,
+            .access_token = null,
+            .refresh_token = null,
+            .expires_at = 0,
+            .source = .none,
+        };
+    }
+
+    /// Update credentials from device flow result
+    pub fn updateFromDeviceFlow(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        session_token: []const u8,
+        identity_token: []const u8,
+        access_token: []const u8,
+        refresh_token: ?[]const u8,
+        username: []const u8,
+        expires_at: i64,
+    ) !void {
+        // Free old values if they were allocated
+        // Note: This is safe because env var pointers are static
+        // and disk pointers need to be tracked separately
+
+        self.session_token = try allocator.dupe(u8, session_token);
+        self.identity_token = try allocator.dupe(u8, identity_token);
+        self.access_token = try allocator.dupe(u8, access_token);
+        if (refresh_token) |rt| {
+            self.refresh_token = try allocator.dupe(u8, rt);
+        }
+        self.username = try allocator.dupe(u8, username);
+        self.expires_at = expires_at;
+        self.source = .device_flow;
     }
 
     /// Internal thread-local buffer for environment variable conversion
@@ -59,10 +186,11 @@ pub const ServerCredentials = struct {
     /// Returns a slice from a thread-local buffer, valid until next call
     fn getEnvVar(name: []const u8) ?[]const u8 {
         if (builtin.os.tag == .windows) {
-            // Convert name to UTF-16 for Windows API
-            var name_w: [256]u16 = undefined;
-            const name_w_len = std.unicode.wtf8ToWtf16Le(&name_w, name) catch return null;
-            const name_w_z = name_w[0..name_w_len :0];
+            // Convert name to UTF-16 for Windows API with null terminator
+            var name_w: [257]u16 = undefined; // Extra space for null terminator
+            const name_w_len = std.unicode.wtf8ToWtf16Le(name_w[0..256], name) catch return null;
+            name_w[name_w_len] = 0; // Add null terminator
+            const name_w_z: [:0]const u16 = name_w[0..name_w_len :0];
 
             const Environ = std.process.Environ;
             if (Environ.getWindows(.{ .block = {} }, name_w_z)) |value_w| {
@@ -91,6 +219,18 @@ pub const ServerCredentials = struct {
     pub fn logStatus(self: *const Self) void {
         std.debug.print("  Auth Credentials:\n", .{});
 
+        const source_str = switch (self.source) {
+            .none => "none",
+            .environment => "environment",
+            .disk => "disk",
+            .device_flow => "device flow",
+        };
+        std.debug.print("    Source: {s}\n", .{source_str});
+
+        if (self.username) |name| {
+            std.debug.print("    Username: {s}\n", .{name});
+        }
+
         if (self.session_token) |token| {
             std.debug.print("    Session token: configured ({d} chars)\n", .{token.len});
         } else {
@@ -111,12 +251,24 @@ pub const ServerCredentials = struct {
 
         std.debug.print("    Audience: {s}\n", .{self.audience});
 
+        if (self.expires_at > 0) {
+            const now = getTimestamp();
+            if (now < self.expires_at) {
+                const remaining = self.expires_at - now;
+                std.debug.print("    Expires in: {d} seconds\n", .{remaining});
+            } else {
+                std.debug.print("    Expires in: EXPIRED\n", .{});
+            }
+        }
+
         if (self.isValid()) {
             std.debug.print("    Status: READY for authenticated clients\n", .{});
+        } else if (self.refresh_token != null) {
+            std.debug.print("    Status: EXPIRED (can refresh)\n", .{});
+            std.debug.print("           Use /auth refresh to renew tokens\n", .{});
         } else {
-            std.debug.print("    Status: DEVELOPMENT MODE ONLY\n", .{});
-            std.debug.print("           (Set HYTALE_SERVER_SESSION_TOKEN and HYTALE_SERVER_IDENTITY_TOKEN\n", .{});
-            std.debug.print("            to enable authenticated client connections)\n", .{});
+            std.debug.print("    Status: NOT AUTHENTICATED\n", .{});
+            std.debug.print("           Use /auth login device to authenticate\n", .{});
         }
     }
 };
@@ -144,6 +296,11 @@ test "server credentials from environment" {
         .identity_token = "test-identity",
         .cert_fingerprint = "abc123",
         .audience = "test-audience",
+        .username = "TestUser",
+        .access_token = null,
+        .refresh_token = null,
+        .expires_at = 0,
+        .source = .environment,
     };
 
     try std.testing.expect(creds.isValid());
@@ -156,10 +313,22 @@ test "missing credentials" {
         .identity_token = null,
         .cert_fingerprint = null,
         .audience = "hytale-game-server",
+        .username = null,
+        .access_token = null,
+        .refresh_token = null,
+        .expires_at = 0,
+        .source = .none,
     };
 
     try std.testing.expect(!creds.isValid());
     try std.testing.expect(!creds.hasCertFingerprint());
+}
+
+test "empty credentials" {
+    const creds = ServerCredentials.empty();
+
+    try std.testing.expect(!creds.isValid());
+    try std.testing.expect(creds.source == .none);
 }
 
 test "compute cert fingerprint" {
