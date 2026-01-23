@@ -10,3 +10,4 @@ zig-cache/
 # OS
 .DS_Store
 Thumbs.db
+/HytaleServerSource
