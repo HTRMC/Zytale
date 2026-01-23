@@ -11,3 +11,4 @@ zig-cache/
 .DS_Store
 Thumbs.db
 /HytaleServerSource
+/compiler

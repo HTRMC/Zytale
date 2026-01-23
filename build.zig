@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // Main proxy executable
+    // Main proxy/server executable
     const exe = b.addExecutable(.{
         .name = "zytale",
         .root_module = b.createModule(.{
@@ -24,6 +24,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Link Windows libraries for QUIC and crypto
+    if (target.result.os.tag == .windows) {
+        exe.root_module.linkSystemLibrary("ws2_32", .{});
+        exe.root_module.linkSystemLibrary("crypt32", .{});
+        exe.root_module.linkSystemLibrary("ncrypt", .{});
+    }
+
     b.installArtifact(exe);
 
     // Run command
@@ -34,7 +41,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const run_step = b.step("run", "Run the proxy");
+    const run_step = b.step("run", "Run the proxy/server");
     run_step.dependOn(&run_cmd.step);
 
     // List packets tool
@@ -58,16 +65,27 @@ pub fn build(b: *std.Build) void {
     const list_packets_step = b.step("list-packets", "List all known Hytale packets");
     list_packets_step.dependOn(&list_packets_cmd.step);
 
-    // Unit tests
-    const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/protocol/registry.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
+    // Unit tests - test standalone modules that don't have relative imports
+    const test_modules = [_][]const u8{
+        "src/protocol/registry.zig",
+        "src/net/packet/varint.zig",
+        "src/net/packet/frame.zig",
+        "src/world/constants.zig",
+        "src/net/compression/zstd.zig",
+    };
 
-    const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_unit_tests.step);
+
+    for (test_modules) |test_path| {
+        const unit_test = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(test_path),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+
+        const run_test = b.addRunArtifact(unit_test);
+        test_step.dependOn(&run_test.step);
+    }
 }

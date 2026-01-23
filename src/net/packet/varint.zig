@@ -14,21 +14,27 @@ pub const VarIntError = error{
 /// Returns the value and number of bytes consumed
 pub fn readVarInt(data: []const u8) VarIntError!struct { value: u32, bytes_read: usize } {
     var value: u32 = 0;
-    var shift: u5 = 0;
+    var shift: u8 = 0; // Use u8 to avoid overflow
     var bytes_read: usize = 0;
 
     for (data) |byte| {
         bytes_read += 1;
 
-        // Extract 7 bits of data
-        const segment: u32 = @as(u32, byte & 0x7F);
-
-        // Check for overflow before shifting
-        if (shift >= 32) {
+        // Max 5 bytes for 32-bit value
+        if (bytes_read > 5) {
             return VarIntError.Overflow;
         }
 
-        value |= segment << shift;
+        // Extract 7 bits of data
+        const segment: u32 = @as(u32, byte & 0x7F);
+
+        // For the 5th byte (shift = 28), only the bottom 4 bits are valid
+        // (bits 28-31 of u32). The upper 3 bits of the segment would overflow.
+        if (bytes_read == 5 and segment > 0x0F) {
+            return VarIntError.Overflow;
+        }
+
+        value |= segment << @as(u5, @intCast(shift));
         shift += 7;
 
         // If MSB is not set, we're done
@@ -36,8 +42,9 @@ pub fn readVarInt(data: []const u8) VarIntError!struct { value: u32, bytes_read:
             return .{ .value = value, .bytes_read = bytes_read };
         }
 
-        // Max 5 bytes for 32-bit value
-        if (bytes_read >= 5) {
+        // If MSB is set on the 5th byte, that would require a 6th byte
+        // which is an overflow for a 32-bit VarInt
+        if (bytes_read == 5) {
             return VarIntError.Overflow;
         }
     }
@@ -162,4 +169,25 @@ test "varint size calculation" {
     try std.testing.expectEqual(@as(usize, 2), varIntSize(16383));
     try std.testing.expectEqual(@as(usize, 3), varIntSize(16384));
     try std.testing.expectEqual(@as(usize, 5), varIntSize(0xFFFFFFFF));
+}
+
+test "varint overflow detection" {
+    // Test case: 5 bytes with continuation bit set (would require 6th byte)
+    // This represents an invalid VarInt that overflows u32
+    const overflow_continuation = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    const result1 = readVarInt(&overflow_continuation);
+    try std.testing.expectError(VarIntError.Overflow, result1);
+
+    // Test case: 5th byte with upper bits set (segment > 0x0F)
+    // 5th byte 0x10 means bits 28-31 would exceed 4 bits
+    const overflow_upper_bits = [_]u8{ 0x80, 0x80, 0x80, 0x80, 0x10 };
+    const result2 = readVarInt(&overflow_upper_bits);
+    try std.testing.expectError(VarIntError.Overflow, result2);
+
+    // Test case: Valid 5-byte max value (0xFFFFFFFF)
+    // Encoded as: 0xFF, 0xFF, 0xFF, 0xFF, 0x0F
+    const valid_max = [_]u8{ 0xFF, 0xFF, 0xFF, 0xFF, 0x0F };
+    const result3 = try readVarInt(&valid_max);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), result3.value);
+    try std.testing.expectEqual(@as(usize, 5), result3.bytes_read);
 }
