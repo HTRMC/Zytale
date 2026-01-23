@@ -126,7 +126,7 @@ fn runServer(allocator: std.mem.Allocator) !void {
     std.debug.print("  Download from: https://github.com/microsoft/msquic/releases\n\n", .{});
     std.debug.print("  Type /help for available commands.\n\n", .{});
 
-    server.runServer(allocator, config) catch |err| {
+    server.runServer(allocator, config, &server_creds) catch |err| {
         std.debug.print("  Server error: {}\n", .{err});
         std.debug.print("\n  Server mode requires MsQuic. Falling back to proxy mode.\n\n", .{});
 
