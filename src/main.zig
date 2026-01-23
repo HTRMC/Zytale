@@ -61,6 +61,11 @@ fn runServer(allocator: std.mem.Allocator) !void {
         \\
     , .{port});
 
+    // Check server credentials for authenticated handshake
+    const server_creds = auth.ServerCredentials.fromEnvironment();
+    server_creds.logStatus();
+    std.debug.print("\n", .{});
+
     // Initialize authentication
     var auth_manager = auth.AuthManager.init(allocator, "zytale-server");
     defer auth_manager.deinit();

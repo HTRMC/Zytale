@@ -4,6 +4,12 @@ const OAuthError = @import("oauth.zig").OAuthError;
 const SessionService = @import("session.zig").SessionService;
 const GameSession = @import("session.zig").GameSession;
 
+// Re-export new auth components
+pub const SessionServiceClient = @import("session_service_client.zig").SessionServiceClient;
+pub const SessionServiceError = @import("session_service_client.zig").SessionServiceError;
+pub const ServerCredentials = @import("server_credentials.zig").ServerCredentials;
+pub const computeCertFingerprint = @import("server_credentials.zig").computeCertFingerprint;
+
 const log = std.log.scoped(.auth);
 
 /// Authentication state machine
