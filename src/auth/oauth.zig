@@ -9,6 +9,25 @@ fn getTimestamp() i64 {
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s));
 }
 
+/// Log unknown fields in a JSON object
+fn logUnknownFields(comptime context: []const u8, json_value: std.json.Value, known_fields: []const []const u8) void {
+    if (json_value != .object) return;
+
+    var iter = json_value.object.iterator();
+    while (iter.next()) |entry| {
+        var is_known = false;
+        for (known_fields) |known| {
+            if (std.mem.eql(u8, entry.key_ptr.*, known)) {
+                is_known = true;
+                break;
+            }
+        }
+        if (!is_known) {
+            log.warn(context ++ ": unexpected field '{s}'", .{entry.key_ptr.*});
+        }
+    }
+}
+
 /// OAuth 2.0 Device Authorization Flow
 /// Used to authenticate users via Hytale's authentication service
 /// The user visits a URL and enters a code, then the server polls for completion
@@ -213,7 +232,18 @@ pub const OAuthClient = struct {
         };
         defer self.allocator.free(response);
 
-        // Parse JSON response
+        // Parse JSON response - first as dynamic to log unknown fields
+        const dynamic = std.json.parseFromSlice(std.json.Value, self.allocator, response, .{}) catch {
+            log.err("Failed to parse device authorization response as JSON: {s}", .{response});
+            return OAuthError.ParseError;
+        };
+        defer dynamic.deinit();
+
+        // Log any unexpected fields
+        const device_auth_fields = [_][]const u8{ "device_code", "user_code", "verification_uri", "verification_uri_complete", "expires_in", "interval" };
+        logUnknownFields("device auth response", dynamic.value, &device_auth_fields);
+
+        // Now parse into typed struct
         const parsed = std.json.parseFromSlice(struct {
             device_code: []const u8,
             user_code: []const u8,
@@ -221,8 +251,8 @@ pub const OAuthClient = struct {
             verification_uri_complete: ?[]const u8 = null,
             expires_in: u32,
             interval: u32,
-        }, self.allocator, response, .{}) catch {
-            log.err("Failed to parse device authorization response: {s}", .{response});
+        }, self.allocator, response, .{ .ignore_unknown_fields = true }) catch {
+            log.err("Failed to parse device authorization response fields: {s}", .{response});
             return OAuthError.ParseError;
         };
         defer parsed.deinit();
@@ -284,11 +314,18 @@ pub const OAuthClient = struct {
         };
         defer self.allocator.free(response);
 
+        // Parse as dynamic first to check for errors and log unknown fields
+        const dynamic = std.json.parseFromSlice(std.json.Value, self.allocator, response, .{}) catch {
+            log.err("Failed to parse token response as JSON: {s}", .{response});
+            return OAuthError.ParseError;
+        };
+        defer dynamic.deinit();
+
         // Check for error response first
         if (std.json.parseFromSlice(struct {
             @"error": []const u8,
             error_description: ?[]const u8 = null,
-        }, self.allocator, response, .{})) |error_parsed| {
+        }, self.allocator, response, .{ .ignore_unknown_fields = true })) |error_parsed| {
             defer error_parsed.deinit();
             const error_code = error_parsed.value.@"error";
 
@@ -312,6 +349,10 @@ pub const OAuthClient = struct {
             // Not an error response, try parsing as token response
         }
 
+        // Log unknown fields in token response
+        const token_fields = [_][]const u8{ "access_token", "refresh_token", "id_token", "token_type", "expires_in", "scope" };
+        logUnknownFields("token response", dynamic.value, &token_fields);
+
         // Parse successful token response
         const parsed = std.json.parseFromSlice(struct {
             access_token: []const u8,
@@ -320,7 +361,7 @@ pub const OAuthClient = struct {
             token_type: []const u8 = "Bearer",
             expires_in: u32 = 3600,
             scope: ?[]const u8 = null,
-        }, self.allocator, response, .{}) catch {
+        }, self.allocator, response, .{ .ignore_unknown_fields = true }) catch {
             log.err("Failed to parse token response: {s}", .{response});
             return OAuthError.ParseError;
         };
@@ -381,11 +422,18 @@ pub const OAuthClient = struct {
         };
         defer self.allocator.free(response);
 
+        // Parse as dynamic first to log unknown fields
+        const dynamic = std.json.parseFromSlice(std.json.Value, self.allocator, response, .{}) catch {
+            log.err("Failed to parse refresh token response as JSON: {s}", .{response});
+            return OAuthError.ParseError;
+        };
+        defer dynamic.deinit();
+
         // Check for error response
         if (std.json.parseFromSlice(struct {
             @"error": []const u8,
             error_description: ?[]const u8 = null,
-        }, self.allocator, response, .{})) |error_parsed| {
+        }, self.allocator, response, .{ .ignore_unknown_fields = true })) |error_parsed| {
             defer error_parsed.deinit();
             const error_code = error_parsed.value.@"error";
 
@@ -397,6 +445,10 @@ pub const OAuthClient = struct {
             }
         } else |_| {}
 
+        // Log unknown fields
+        const token_fields = [_][]const u8{ "access_token", "refresh_token", "id_token", "token_type", "expires_in", "scope" };
+        logUnknownFields("refresh token response", dynamic.value, &token_fields);
+
         // Parse successful token response
         const parsed = std.json.parseFromSlice(struct {
             access_token: []const u8,
@@ -405,7 +457,7 @@ pub const OAuthClient = struct {
             token_type: []const u8 = "Bearer",
             expires_in: u32 = 3600,
             scope: ?[]const u8 = null,
-        }, self.allocator, response, .{}) catch {
+        }, self.allocator, response, .{ .ignore_unknown_fields = true }) catch {
             log.err("Failed to parse refresh token response: {s}", .{response});
             return OAuthError.ParseError;
         };
