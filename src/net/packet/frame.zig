@@ -10,6 +10,20 @@ pub const MAX_PAYLOAD_SIZE: usize = 1_677_721_600; // ~1.6 GB from Java source
 pub const Frame = struct {
     id: u32,
     payload: []const u8,
+    /// If true, payload memory is owned and must be freed with deinit()
+    owned: bool = false,
+    allocator: ?std.mem.Allocator = null,
+
+    /// Free owned payload memory
+    pub fn deinit(self: *Frame) void {
+        if (self.owned) {
+            if (self.allocator) |alloc| {
+                alloc.free(self.payload);
+            }
+        }
+        self.payload = &[_]u8{};
+        self.owned = false;
+    }
 };
 
 pub const FrameParser = struct {
@@ -33,6 +47,7 @@ pub const FrameParser = struct {
     }
 
     /// Try to extract the next complete frame
+    /// Note: The returned Frame owns its payload memory and must be freed with frame.deinit()
     pub fn nextFrame(self: *FrameParser) ?Frame {
         if (self.buffer.items.len < FRAME_HEADER_SIZE) {
             return null;
@@ -55,8 +70,11 @@ pub const FrameParser = struct {
             return null;
         }
 
-        // Extract payload
-        const payload = self.buffer.items[FRAME_HEADER_SIZE..total_size];
+        // Copy payload to owned memory BEFORE modifying buffer
+        // This prevents the dangling pointer bug where the slice would point to
+        // buffer memory that gets corrupted when we remove the consumed bytes
+        const payload = self.allocator.alloc(u8, length) catch return null;
+        @memcpy(payload, self.buffer.items[FRAME_HEADER_SIZE..total_size]);
 
         // Remove consumed bytes from buffer
         const remaining = self.buffer.items[total_size..];
@@ -66,6 +84,8 @@ pub const FrameParser = struct {
         return Frame{
             .id = packet_id,
             .payload = payload,
+            .owned = true,
+            .allocator = self.allocator,
         };
     }
 
@@ -111,10 +131,12 @@ test "frame parsing" {
     // Feed rest
     parser.feed(test_frame[4..]);
 
-    const frame_result = parser.nextFrame();
+    var frame_result = parser.nextFrame();
     try std.testing.expect(frame_result != null);
+    defer frame_result.?.deinit(); // Free owned payload memory
     try std.testing.expectEqual(@as(u32, 42), frame_result.?.id);
     try std.testing.expectEqualStrings("hello", frame_result.?.payload);
+    try std.testing.expect(frame_result.?.owned); // Verify ownership flag is set
 }
 
 test "encode frame" {
