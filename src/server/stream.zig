@@ -18,6 +18,12 @@ pub const ConnectionPhase = enum {
     playing, // Client is fully connected
 };
 
+/// Pending send buffer awaiting SEND_COMPLETE callback from MsQuic
+const PendingSend = struct {
+    buffer: []u8,
+    quic_buffer: msquic.QUIC_BUFFER,
+};
+
 /// QUIC Stream handler for Hytale protocol
 /// Each stream carries framed packets with the Hytale packet format
 pub const Stream = struct {
@@ -27,6 +33,9 @@ pub const Stream = struct {
     parser: frame.FrameParser,
     connection: ?*anyopaque, // Parent connection context
     send_buffer: std.ArrayList(u8),
+
+    // Track buffers until MsQuic SEND_COMPLETE callback
+    pending_sends: std.ArrayListUnmanaged(PendingSend),
 
     // Protocol state
     phase: ConnectionPhase,
@@ -47,6 +56,7 @@ pub const Stream = struct {
             .parser = frame.FrameParser.init(allocator),
             .connection = null,
             .send_buffer = .empty,
+            .pending_sends = .empty,
             .phase = .initial,
             .player_uuid = null,
             .username = null,
@@ -54,6 +64,12 @@ pub const Stream = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Free any remaining pending send buffers
+        for (self.pending_sends.items) |pending| {
+            self.allocator.free(pending.buffer);
+        }
+        self.pending_sends.deinit(self.allocator);
+
         self.parser.deinit();
         self.send_buffer.deinit(self.allocator);
         if (self.username) |name| {
@@ -324,34 +340,41 @@ pub const Stream = struct {
     }
 
     /// Send a packet to the client
+    /// Buffer lifetime: the encoded frame is kept alive until MsQuic fires SEND_COMPLETE
     pub fn sendPacket(self: *Self, packet_id: u32, payload: []const u8) !void {
         const encoded = try frame.encodeFrame(self.allocator, packet_id, payload);
 
-        // We need to keep the buffer alive until send completes
-        // For now, use QUIC_SEND_FLAG_NONE and don't free immediately
-        // MsQuic will copy the data
-        defer self.allocator.free(encoded);
+        // Create pending send entry - buffer stays alive until SEND_COMPLETE
+        try self.pending_sends.append(self.allocator, .{
+            .buffer = encoded,
+            .quic_buffer = .{
+                .length = @intCast(encoded.len),
+                .buffer = encoded.ptr,
+            },
+        });
 
-        var buffer = msquic.QUIC_BUFFER{
-            .length = @intCast(encoded.len),
-            .buffer = @constCast(encoded.ptr),
-        };
+        const pending = &self.pending_sends.items[self.pending_sends.items.len - 1];
 
+        // Pass pointer to pending entry as client_context - returned in SEND_COMPLETE
         const status = self.api.stream_send(
             self.handle,
-            @ptrCast(&buffer),
+            @ptrCast(&pending.quic_buffer),
             1,
             msquic.QUIC_SEND_FLAG_NONE,
-            null,
+            pending, // client_context: returned in SEND_COMPLETE callback
         );
 
         if (msquic.QUIC_FAILED(status)) {
+            // Failed immediately - clean up the buffer we just added
+            _ = self.pending_sends.pop();
+            self.allocator.free(encoded);
             log.err("Stream send failed: 0x{X:0>8}", .{status});
             return error.SendFailed;
         }
 
         const name = registry.getName(packet_id);
         log.info("Sent [{s}] ID={d} len={d}", .{ name, packet_id, payload.len });
+        // DON'T free here - wait for SEND_COMPLETE callback
     }
 
     fn sendPong(self: *Self, ping_payload: []const u8) !void {
@@ -422,6 +445,25 @@ pub fn streamCallback(
 
         .SEND_COMPLETE => {
             const canceled = event.payload.send_complete.canceled != 0;
+            const client_ctx = event.payload.send_complete.client_context;
+
+            if (client_ctx) |ctx| {
+                const pending: *PendingSend = @ptrCast(@alignCast(ctx));
+
+                // Free the buffer now that MsQuic is done with it
+                stream.allocator.free(pending.buffer);
+
+                // Remove from pending list by finding and swap-removing
+                for (stream.pending_sends.items, 0..) |*item, i| {
+                    if (item == pending) {
+                        _ = stream.pending_sends.swapRemove(i);
+                        break;
+                    }
+                }
+
+                log.debug("SEND_COMPLETE: freed buffer, {d} pending remain", .{stream.pending_sends.items.len});
+            }
+
             if (canceled) {
                 log.warn("Stream send was canceled", .{});
             }
