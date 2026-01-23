@@ -5,6 +5,9 @@ const registry = @import("protocol");
 const serializer = @import("../protocol/packets/serializer.zig");
 const zstd = @import("../net/compression/zstd.zig");
 const auth = @import("../auth/auth.zig");
+const assets = @import("../assets/mod.zig");
+const Server = @import("server.zig").Server;
+const Connection = @import("connection.zig").Connection;
 
 const log = std.log.scoped(.stream);
 
@@ -371,8 +374,16 @@ pub const Stream = struct {
 
         self.phase = .loading;
 
-        // Send asset-related packets (minimal for now)
-        // In a full implementation, we'd parse the requested assets and send them
+        // Get the server's asset registry through the connection chain
+        const asset_registry = self.getAssetRegistry();
+        if (asset_registry) |reg| {
+            // Generate and send all asset Update* packets
+            self.sendAssetPackets(reg) catch |err| {
+                log.err("Failed to send asset packets: {}", .{err});
+            };
+        } else {
+            log.warn("No asset registry available - skipping asset packets", .{});
+        }
 
         // Send WorldLoadProgress
         self.sendWorldLoadProgress("Loading world...", 0, 0) catch |err| {
@@ -387,6 +398,45 @@ pub const Stream = struct {
         };
 
         log.info("Sent world load packets", .{});
+    }
+
+    /// Get the asset registry from the server through the connection chain
+    fn getAssetRegistry(self: *Self) ?*assets.AssetRegistry {
+        // Get Connection from our context
+        const conn_ptr = self.connection orelse return null;
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        // Get Server from Connection's server_context
+        const server_ptr = conn.server_context orelse return null;
+        const server: *Server = @ptrCast(@alignCast(server_ptr));
+
+        return &server.asset_registry;
+    }
+
+    /// Send all asset Update* packets to the client
+    fn sendAssetPackets(self: *Self, reg: *assets.AssetRegistry) !void {
+        log.info("Generating asset packets...", .{});
+
+        var packets = try reg.generateInitPackets();
+        defer {
+            for (packets.items) |p| {
+                self.allocator.free(p.payload);
+            }
+            packets.deinit(self.allocator);
+        }
+
+        log.info("Sending {d} asset packets...", .{packets.items.len});
+
+        var sent_count: usize = 0;
+        for (packets.items) |p| {
+            self.sendPacket(p.packet_id, p.payload) catch |err| {
+                log.err("Failed to send asset packet ID={d}: {}", .{ p.packet_id, err });
+                continue;
+            };
+            sent_count += 1;
+        }
+
+        log.info("Sent {d}/{d} asset packets", .{ sent_count, packets.items.len });
     }
 
     fn handleViewRadius(_: *Self, payload: []const u8) void {
