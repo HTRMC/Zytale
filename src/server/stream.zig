@@ -2,8 +2,21 @@ const std = @import("std");
 const msquic = @import("msquic.zig");
 const frame = @import("../net/packet/frame.zig");
 const registry = @import("protocol");
+const serializer = @import("../protocol/packets/serializer.zig");
 
 const log = std.log.scoped(.stream);
+
+/// Expected protocol hash from Java server
+const EXPECTED_PROTOCOL_HASH = "6708f121966c1c443f4b0eb525b2f81d0a8dc61f5003a692a8fa157e5e02cea9";
+
+/// Connection phase for the protocol state machine
+pub const ConnectionPhase = enum {
+    initial, // Waiting for Connect packet
+    password, // Waiting for PasswordResponse (if password required)
+    setup, // Setup phase: sent WorldSettings, waiting for RequestAssets
+    loading, // Sending assets and world data
+    playing, // Client is fully connected
+};
 
 /// QUIC Stream handler for Hytale protocol
 /// Each stream carries framed packets with the Hytale packet format
@@ -14,6 +27,11 @@ pub const Stream = struct {
     parser: frame.FrameParser,
     connection: ?*anyopaque, // Parent connection context
     send_buffer: std.ArrayList(u8),
+
+    // Protocol state
+    phase: ConnectionPhase,
+    player_uuid: ?[16]u8,
+    username: ?[]const u8,
 
     const Self = @This();
 
@@ -29,12 +47,18 @@ pub const Stream = struct {
             .parser = frame.FrameParser.init(allocator),
             .connection = null,
             .send_buffer = .empty,
+            .phase = .initial,
+            .player_uuid = null,
+            .username = null,
         };
     }
 
     pub fn deinit(self: *Self) void {
         self.parser.deinit();
         self.send_buffer.deinit(self.allocator);
+        if (self.username) |name| {
+            self.allocator.free(name);
+        }
     }
 
     pub fn setConnectionContext(self: *Self, ctx: ?*anyopaque) void {
@@ -52,6 +76,11 @@ pub const Stream = struct {
 
         // Process complete frames
         while (self.parser.nextFrame()) |pkt| {
+            defer {
+                // Free the owned frame payload
+                var mutable_pkt = pkt;
+                mutable_pkt.deinit();
+            }
             self.handlePacket(pkt);
         }
     }
@@ -59,12 +88,16 @@ pub const Stream = struct {
     /// Process a complete packet frame
     fn handlePacket(self: *Self, pkt: frame.Frame) void {
         const name = registry.getName(pkt.id);
-        log.info("Received [{s}] ID={d} len={d}", .{ name, pkt.id, pkt.payload.len });
+        log.info("Received [{s}] ID={d} len={d} phase={s}", .{ name, pkt.id, pkt.payload.len, @tagName(self.phase) });
 
         // Route packet to handler based on ID
         switch (pkt.id) {
             registry.Connect.id => self.handleConnect(pkt.payload),
-            registry.AuthGrant.id => self.handleAuthGrant(pkt.payload),
+            registry.Disconnect.id => self.handleDisconnect(pkt.payload),
+            registry.PasswordResponse.id => self.handlePasswordResponse(pkt.payload),
+            registry.RequestAssets.id => self.handleRequestAssets(pkt.payload),
+            registry.ViewRadius.id => self.handleViewRadius(pkt.payload),
+            registry.PlayerOptions.id => self.handlePlayerOptions(pkt.payload),
             registry.ClientReady.id => self.handleClientReady(pkt.payload),
             registry.ClientMovement.id => self.handleClientMovement(pkt.payload),
             registry.Ping.id => self.handlePing(pkt.payload),
@@ -75,33 +108,145 @@ pub const Stream = struct {
     }
 
     fn handleConnect(self: *Self, payload: []const u8) void {
-        _ = self;
-        log.info("Client sending Connect packet, len={d}", .{payload.len});
-        // Connect packet contains:
-        // - Protocol version
-        // - Client UUID
-        // - Username
-        // - Auth token info
-        // Response will be handled by connection handler after auth
+        if (self.phase != .initial) {
+            log.warn("Received Connect in wrong phase: {s}", .{@tagName(self.phase)});
+            return;
+        }
+
+        log.info("Parsing Connect packet, len={d}", .{payload.len});
+
+        // Parse the Connect packet
+        const connect = serializer.ConnectPacket.parse(payload) orelse {
+            log.err("Failed to parse Connect packet", .{});
+            self.sendDisconnect("Protocol error: invalid Connect packet") catch {};
+            return;
+        };
+
+        // Log parsed data
+        const uuid_str = serializer.uuidToString(connect.uuid);
+        log.info("Connect from: username={s}, uuid={s}", .{ connect.username, &uuid_str });
+        log.info("Protocol hash: {s}", .{connect.protocol_hash});
+        if (connect.language) |lang| {
+            log.info("Language: {s}", .{lang});
+        }
+
+        // Validate protocol hash
+        if (!std.mem.eql(u8, connect.protocol_hash, EXPECTED_PROTOCOL_HASH)) {
+            log.err("Protocol hash mismatch!", .{});
+            log.err("Expected: {s}", .{EXPECTED_PROTOCOL_HASH});
+            log.err("Got:      {s}", .{connect.protocol_hash});
+            self.sendDisconnect("Incompatible protocol version") catch {};
+            return;
+        }
+
+        // Store player info
+        self.player_uuid = connect.uuid;
+        if (self.username) |old| {
+            self.allocator.free(old);
+        }
+        self.username = self.allocator.dupe(u8, connect.username) catch null;
+
+        // Check for identity token (authenticated mode)
+        if (connect.identity_token != null) {
+            log.info("Client has identity token - authenticated mode not yet supported", .{});
+            // For now, treat as development mode
+        }
+
+        // Development mode: send ConnectAccept with no password
+        log.info("Sending ConnectAccept (no password)", .{});
+        self.sendConnectAccept(null) catch |err| {
+            log.err("Failed to send ConnectAccept: {}", .{err});
+            return;
+        };
+
+        // No password required, proceed directly to setup
+        self.phase = .setup;
+        self.beginSetupPhase() catch |err| {
+            log.err("Failed to begin setup phase: {}", .{err});
+        };
     }
 
-    fn handleAuthGrant(self: *Self, payload: []const u8) void {
-        _ = self;
-        log.info("Client sent AuthGrant, len={d}", .{payload.len});
-        // AuthGrant contains the authentication token from the client
-        // Server should verify and send ConnectAccept
+    fn handleDisconnect(self: *Self, payload: []const u8) void {
+        _ = payload;
+        log.info("Client sent Disconnect", .{});
+        self.shutdown();
     }
 
-    fn handleClientReady(self: *Self, payload: []const u8) void {
-        _ = self;
-        log.info("Client is ready, len={d}", .{payload.len});
-        // Client has loaded all chunks and is ready to play
+    fn handlePasswordResponse(self: *Self, payload: []const u8) void {
+        if (self.phase != .password) {
+            log.warn("Received PasswordResponse in wrong phase", .{});
+            return;
+        }
+
+        _ = payload;
+        // For now, accept any password (development mode)
+        log.info("Accepting password (development mode)", .{});
+
+        self.sendPasswordAccepted() catch |err| {
+            log.err("Failed to send PasswordAccepted: {}", .{err});
+            return;
+        };
+
+        self.phase = .setup;
+        self.beginSetupPhase() catch |err| {
+            log.err("Failed to begin setup phase: {}", .{err});
+        };
     }
 
-    fn handleClientMovement(self: *Self, payload: []const u8) void {
-        _ = self;
+    fn handleRequestAssets(self: *Self, payload: []const u8) void {
+        if (self.phase != .setup) {
+            log.warn("Received RequestAssets in wrong phase: {s}", .{@tagName(self.phase)});
+            return;
+        }
+
+        _ = payload;
+        log.info("Client requesting assets", .{});
+
+        self.phase = .loading;
+
+        // Send asset-related packets (minimal for now)
+        // In a full implementation, we'd parse the requested assets and send them
+
+        // Send WorldLoadProgress
+        self.sendWorldLoadProgress("Loading world...", 0, 0) catch |err| {
+            log.err("Failed to send WorldLoadProgress: {}", .{err});
+            return;
+        };
+
+        // Send WorldLoadFinished
+        self.sendWorldLoadFinished() catch |err| {
+            log.err("Failed to send WorldLoadFinished: {}", .{err});
+            return;
+        };
+
+        log.info("Sent world load packets", .{});
+    }
+
+    fn handleViewRadius(_: *Self, payload: []const u8) void {
+        if (payload.len < 4) return;
+        const radius = std.mem.readInt(i32, payload[0..4], .little);
+        log.info("Client view radius: {d} units", .{radius});
+    }
+
+    fn handlePlayerOptions(self: *Self, payload: []const u8) void {
+        log.info("Received PlayerOptions, len={d}", .{payload.len});
+
+        // This is the final step - client is ready to enter world
+        self.phase = .playing;
+
+        // TODO: Add player to universe, spawn entity, etc.
+        log.info("Client fully connected!", .{});
+    }
+
+    fn handleClientReady(_: *Self, payload: []const u8) void {
+        _ = payload;
+        log.info("Client is ready to play", .{});
+    }
+
+    fn handleClientMovement(_: *Self, payload: []const u8) void {
+        _ = payload;
         // ClientMovement is sent frequently, only log at debug level
-        log.debug("Client movement, len={d}", .{payload.len});
+        log.debug("Client movement", .{});
     }
 
     fn handlePing(self: *Self, payload: []const u8) void {
@@ -112,9 +257,79 @@ pub const Stream = struct {
         };
     }
 
+    // ============================================
+    // Packet sending functions
+    // ============================================
+
+    fn sendConnectAccept(self: *Self, password_challenge: ?[]const u8) !void {
+        const payload = try serializer.serializeConnectAccept(self.allocator, password_challenge);
+        defer self.allocator.free(payload);
+        try self.sendPacket(registry.ConnectAccept.id, payload);
+        log.info("Sent ConnectAccept", .{});
+    }
+
+    fn sendPasswordAccepted(self: *Self) !void {
+        const payload = try serializer.serializePasswordAccepted(self.allocator);
+        defer self.allocator.free(payload);
+        try self.sendPacket(registry.PasswordAccepted.id, payload);
+        log.info("Sent PasswordAccepted", .{});
+    }
+
+    fn sendWorldSettings(self: *Self, world_height: i32) !void {
+        const payload = try serializer.serializeWorldSettings(self.allocator, world_height);
+        defer self.allocator.free(payload);
+        try self.sendPacket(registry.WorldSettings.id, payload);
+        log.info("Sent WorldSettings (height={d})", .{world_height});
+    }
+
+    fn sendServerInfo(self: *Self, server_name: []const u8, motd: []const u8, max_players: i32) !void {
+        const payload = try serializer.serializeServerInfo(self.allocator, server_name, motd, max_players);
+        defer self.allocator.free(payload);
+        try self.sendPacket(registry.ServerInfo.id, payload);
+        log.info("Sent ServerInfo", .{});
+    }
+
+    fn sendWorldLoadProgress(self: *Self, message: []const u8, current: i32, total: i32) !void {
+        const payload = try serializer.serializeWorldLoadProgress(self.allocator, message, current, total);
+        defer self.allocator.free(payload);
+        try self.sendPacket(registry.WorldLoadProgress.id, payload);
+        log.info("Sent WorldLoadProgress", .{});
+    }
+
+    fn sendWorldLoadFinished(self: *Self) !void {
+        const payload = try serializer.serializeWorldLoadFinished(self.allocator);
+        defer self.allocator.free(payload);
+        try self.sendPacket(registry.WorldLoadFinished.id, payload);
+        log.info("Sent WorldLoadFinished", .{});
+    }
+
+    fn sendDisconnect(self: *Self, reason: []const u8) !void {
+        const payload = try serializer.serializeDisconnect(self.allocator, reason, .Disconnect);
+        defer self.allocator.free(payload);
+        try self.sendPacket(registry.Disconnect.id, payload);
+        log.info("Sent Disconnect: {s}", .{reason});
+    }
+
+    /// Begin the setup phase - send WorldSettings and ServerInfo
+    fn beginSetupPhase(self: *Self) !void {
+        log.info("Beginning setup phase", .{});
+
+        // Send WorldSettings (world height = 320, like Java)
+        try self.sendWorldSettings(320);
+
+        // Send ServerInfo
+        try self.sendServerInfo("Zytale Server", "A Hytale server replica", 100);
+
+        log.info("Setup packets sent, waiting for RequestAssets", .{});
+    }
+
     /// Send a packet to the client
     pub fn sendPacket(self: *Self, packet_id: u32, payload: []const u8) !void {
         const encoded = try frame.encodeFrame(self.allocator, packet_id, payload);
+
+        // We need to keep the buffer alive until send completes
+        // For now, use QUIC_SEND_FLAG_NONE and don't free immediately
+        // MsQuic will copy the data
         defer self.allocator.free(encoded);
 
         var buffer = msquic.QUIC_BUFFER{
@@ -136,7 +351,7 @@ pub const Stream = struct {
         }
 
         const name = registry.getName(packet_id);
-        log.debug("Sent [{s}] ID={d} len={d}", .{ name, packet_id, payload.len });
+        log.info("Sent [{s}] ID={d} len={d}", .{ name, packet_id, payload.len });
     }
 
     fn sendPong(self: *Self, ping_payload: []const u8) !void {
@@ -157,7 +372,7 @@ pub const Stream = struct {
 
     /// Gracefully shutdown the stream
     pub fn shutdown(self: *Self) void {
-        self.api.stream_shutdown(
+        _ = self.api.stream_shutdown(
             self.handle,
             msquic.QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL,
             0,
@@ -230,9 +445,9 @@ pub fn streamCallback(
             const conn_shutdown = event.payload.shutdown_complete.connection_shutdown != 0;
             log.info("Stream shutdown complete (connection_shutdown={any})", .{conn_shutdown});
 
-            // Clean up the stream
-            stream.deinit();
-            stream.close();
+            // NOTE: Don't clean up the stream here!
+            // The Connection owns the stream and will clean it up in its SHUTDOWN_COMPLETE handler.
+            // Cleaning up here causes double-free crashes.
         },
 
         else => {

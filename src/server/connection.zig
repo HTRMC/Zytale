@@ -76,12 +76,18 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Self) void {
+        // Clean up the stream
         if (self.main_stream) |stream| {
+            // First deinit the stream's internal resources
             stream.deinit();
+            // Then close the MsQuic stream handle
+            stream.close();
+            // Finally free the stream struct
             self.allocator.destroy(stream);
             self.main_stream = null;
         }
 
+        // Free username if allocated
         if (self.username) |name| {
             self.allocator.free(name);
             self.username = null;
@@ -266,12 +272,17 @@ pub fn connectionCallback(
             const completed = event.payload.shutdown_complete.handshake_completed != 0;
             log.info("Connection shutdown complete (handshake_completed={})", .{completed});
 
-            // Clean up connection
+            // Save allocator before deinit (deinit may clear fields)
+            const allocator = conn.allocator;
+
+            // Clean up connection resources first
             conn.deinit();
+
+            // Close the MsQuic handle
             conn.close();
 
-            // Free the connection struct
-            conn.allocator.destroy(conn);
+            // Free the connection struct itself
+            allocator.destroy(conn);
         },
 
         .PEER_STREAM_STARTED => {
