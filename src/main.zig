@@ -17,8 +17,7 @@ pub fn main() !void {
 
     // Configuration (hardcoded for now)
     // Change this to .server to run as a server instead of proxy
-    const mode: Mode = .proxy
-    ;
+    const mode: Mode = .server;
 
     switch (mode) {
         .proxy => try runProxy(allocator),

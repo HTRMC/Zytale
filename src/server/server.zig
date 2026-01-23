@@ -141,14 +141,12 @@ pub const Server = struct {
         settings.peer_unidi_stream_count = 1;
         settings.is_set.peer_unidi_stream_count = true;
 
-        // Create ALPN buffer
-        const alpn_len: u8 = @intCast(self.config.alpn.len);
+        // Create ALPN buffer (raw protocol name, no length prefix - MsQuic handles that)
         var alpn_data: [256]u8 = undefined;
-        alpn_data[0] = alpn_len;
-        @memcpy(alpn_data[1 .. 1 + alpn_len], self.config.alpn);
+        @memcpy(alpn_data[0..self.config.alpn.len], self.config.alpn);
 
         var alpn_buffer = msquic.QUIC_BUFFER{
-            .length = 1 + @as(u32, alpn_len),
+            .length = @intCast(self.config.alpn.len),
             .buffer = &alpn_data,
         };
 
@@ -179,9 +177,15 @@ pub const Server = struct {
     fn loadCredentials(self: *Self) !void {
         const api = self.api.?;
 
+        // Require client certificate (mutual TLS) like the Java server
+        // Also indicate when we receive a certificate for logging
+        const cred_flags = msquic.QUIC_CREDENTIAL_FLAG_REQUIRE_CLIENT_AUTHENTICATION |
+            msquic.QUIC_CREDENTIAL_FLAG_INDICATE_CERTIFICATE_RECEIVED |
+            msquic.QUIC_CREDENTIAL_FLAG_NO_CERTIFICATE_VALIDATION; // Accept self-signed client certs
+
         var cred_config = msquic.QUIC_CREDENTIAL_CONFIG{
             .type = .NONE,
-            .flags = msquic.QUIC_CREDENTIAL_FLAG_NONE,
+            .flags = cred_flags,
             .certificate = .{ .hash = null },
             .principal = null,
             .reserved = null,
@@ -246,14 +250,12 @@ pub const Server = struct {
         var addr: msquic.QUIC_ADDR = undefined;
         addr.setUnspecified(msquic.QUIC_ADDRESS_FAMILY_INET, self.config.port);
 
-        // Create ALPN buffer for listener
-        const alpn_len: u8 = @intCast(self.config.alpn.len);
+        // Create ALPN buffer for listener (raw protocol name, no length prefix)
         var alpn_data: [256]u8 = undefined;
-        alpn_data[0] = alpn_len;
-        @memcpy(alpn_data[1 .. 1 + alpn_len], self.config.alpn);
+        @memcpy(alpn_data[0..self.config.alpn.len], self.config.alpn);
 
         var alpn_buffer = msquic.QUIC_BUFFER{
-            .length = 1 + @as(u32, alpn_len),
+            .length = @intCast(self.config.alpn.len),
             .buffer = &alpn_data,
         };
 
