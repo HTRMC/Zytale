@@ -264,7 +264,9 @@ pub const OAuthClient = struct {
 
         self.device_code = self.allocator.dupe(u8, parsed.value.device_code) catch return OAuthError.OutOfMemory;
         self.user_code = self.allocator.dupe(u8, parsed.value.user_code) catch return OAuthError.OutOfMemory;
-        self.verification_uri = self.allocator.dupe(u8, parsed.value.verification_uri) catch return OAuthError.OutOfMemory;
+        // Prefer verification_uri_complete (has code in URL) over plain verification_uri
+        const uri_to_use = parsed.value.verification_uri_complete orelse parsed.value.verification_uri;
+        self.verification_uri = self.allocator.dupe(u8, uri_to_use) catch return OAuthError.OutOfMemory;
         self.poll_interval = parsed.value.interval;
         self.expires_at = getTimestamp() + @as(i64, parsed.value.expires_in);
 
