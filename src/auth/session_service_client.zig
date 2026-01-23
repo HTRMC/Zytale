@@ -84,27 +84,36 @@ pub const SessionServiceClient = struct {
         };
         defer self.allocator.free(response);
 
-        // Parse JSON response (array of profiles)
-        const parsed = std.json.parseFromSlice([]struct {
-            uuid: []const u8,
-            username: []const u8,
-        }, self.allocator, response, .{}) catch {
+        // Parse JSON response - wrapped in object with "owner" and "profiles"
+        const parsed = std.json.parseFromSlice(struct {
+            owner: []const u8,
+            profiles: []const struct {
+                uuid: []const u8,
+                username: []const u8,
+                createdAt: ?[]const u8 = null,
+                entitlements: ?[]const []const u8 = null,
+                nextNameChangeAt: ?[]const u8 = null,
+                skin: ?[]const u8 = null,
+            },
+        }, self.allocator, response, .{ .ignore_unknown_fields = true }) catch {
             log.err("Failed to parse profiles response: {s}", .{response});
             return SessionServiceError.InvalidResponse;
         };
         defer parsed.deinit();
 
-        if (parsed.value.len == 0) {
+        log.debug("Account owner: {s}", .{parsed.value.owner});
+
+        if (parsed.value.profiles.len == 0) {
             log.warn("No profiles found", .{});
             return SessionServiceError.NoProfiles;
         }
 
         // Convert to GameProfile array
-        const profiles = self.allocator.alloc(GameProfile, parsed.value.len) catch
+        const profiles = self.allocator.alloc(GameProfile, parsed.value.profiles.len) catch
             return SessionServiceError.OutOfMemory;
         errdefer self.allocator.free(profiles);
 
-        for (parsed.value, 0..) |profile, i| {
+        for (parsed.value.profiles, 0..) |profile, i| {
             // Parse UUID string to bytes
             profiles[i].uuid = parseUuidString(profile.uuid) catch {
                 log.err("Invalid UUID format: {s}", .{profile.uuid});
@@ -153,23 +162,29 @@ pub const SessionServiceClient = struct {
         };
         defer self.allocator.free(response);
 
-        // Parse JSON response
+        // Parse JSON response - expiresAt comes as ISO 8601 string
         const parsed = std.json.parseFromSlice(struct {
             sessionToken: []const u8,
             identityToken: []const u8,
-            expiresAt: i64,
-        }, self.allocator, response, .{}) catch {
+            expiresAt: []const u8,
+        }, self.allocator, response, .{ .ignore_unknown_fields = true }) catch {
             log.err("Failed to parse session response: {s}", .{response});
             return SessionServiceError.InvalidResponse;
         };
         defer parsed.deinit();
+
+        // Parse ISO 8601 timestamp to Unix epoch
+        const expires_at = parseIso8601ToUnix(parsed.value.expiresAt) catch |err| {
+            log.err("Failed to parse expiresAt timestamp '{s}': {}", .{ parsed.value.expiresAt, err });
+            return SessionServiceError.InvalidResponse;
+        };
 
         const result = GameSessionResponse{
             .session_token = self.allocator.dupe(u8, parsed.value.sessionToken) catch
                 return SessionServiceError.OutOfMemory,
             .identity_token = self.allocator.dupe(u8, parsed.value.identityToken) catch
                 return SessionServiceError.OutOfMemory,
-            .expires_at = parsed.value.expiresAt,
+            .expires_at = expires_at,
         };
 
         log.info("Game session created (expires at {d})", .{result.expires_at});
@@ -436,6 +451,64 @@ pub const SessionServiceClient = struct {
     }
 };
 
+/// Parse ISO 8601 timestamp to Unix epoch seconds
+/// Handles format: "2026-01-23T20:43:39.930178155Z" or "2026-01-23T20:43:39Z"
+fn parseIso8601ToUnix(iso_str: []const u8) !i64 {
+    // Minimum format: YYYY-MM-DDTHH:MM:SSZ (20 chars)
+    if (iso_str.len < 20) return error.InvalidFormat;
+
+    // Parse date components
+    const year = std.fmt.parseInt(i32, iso_str[0..4], 10) catch return error.InvalidYear;
+    if (iso_str[4] != '-') return error.InvalidFormat;
+    const month = std.fmt.parseInt(u8, iso_str[5..7], 10) catch return error.InvalidMonth;
+    if (iso_str[7] != '-') return error.InvalidFormat;
+    const day = std.fmt.parseInt(u8, iso_str[8..10], 10) catch return error.InvalidDay;
+    if (iso_str[10] != 'T') return error.InvalidFormat;
+
+    // Parse time components
+    const hour = std.fmt.parseInt(u8, iso_str[11..13], 10) catch return error.InvalidHour;
+    if (iso_str[13] != ':') return error.InvalidFormat;
+    const minute = std.fmt.parseInt(u8, iso_str[14..16], 10) catch return error.InvalidMinute;
+    if (iso_str[16] != ':') return error.InvalidFormat;
+    const second = std.fmt.parseInt(u8, iso_str[17..19], 10) catch return error.InvalidSecond;
+    // Skip fractional seconds and 'Z' suffix - we only need second precision
+
+    // Validate ranges
+    if (month < 1 or month > 12) return error.InvalidMonth;
+    if (day < 1 or day > 31) return error.InvalidDay;
+    if (hour > 23) return error.InvalidHour;
+    if (minute > 59) return error.InvalidMinute;
+    if (second > 59) return error.InvalidSecond;
+
+    // Convert to Unix timestamp
+    // Days from epoch (1970-01-01) to start of year
+    const years_since_epoch = year - 1970;
+    var days: i64 = years_since_epoch * 365;
+
+    // Add leap years (simplified - works for 1970-2099)
+    days += @divFloor(years_since_epoch + 1, 4);
+
+    // Days in months (non-leap year)
+    const days_in_months = [_]u8{ 0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    for (1..month) |m| {
+        days += days_in_months[m];
+    }
+
+    // Add extra day for leap year if past February
+    const is_leap = (@mod(year, 4) == 0 and @mod(year, 100) != 0) or @mod(year, 400) == 0;
+    if (is_leap and month > 2) {
+        days += 1;
+    }
+
+    // Add days in current month
+    days += day - 1;
+
+    // Convert to seconds
+    const timestamp: i64 = days * 86400 + @as(i64, hour) * 3600 + @as(i64, minute) * 60 + @as(i64, second);
+
+    return timestamp;
+}
+
 /// Parse UUID string (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx) to 16 bytes
 fn parseUuidString(uuid_str: []const u8) ![16]u8 {
     if (uuid_str.len != 36) return error.InvalidLength;
@@ -572,4 +645,23 @@ test "uuid to string" {
     const uuid_str = uuidToString(uuid_bytes);
 
     try std.testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", &uuid_str);
+}
+
+test "iso 8601 parsing" {
+    // Test with fractional seconds (like the API returns)
+    const ts1 = try parseIso8601ToUnix("2026-01-23T20:43:39.930178155Z");
+    // 2026-01-23 20:43:39 UTC
+    // Days from 1970-01-01 to 2026-01-23:
+    // 56 years = 56*365 + 14 leap days = 20454 days to 2026-01-01
+    // + 22 days (Jan 23) = 20476 days
+    // 20476 * 86400 + 20*3600 + 43*60 + 39 = 1769293419
+    try std.testing.expectEqual(@as(i64, 1769293419), ts1);
+
+    // Test without fractional seconds
+    const ts2 = try parseIso8601ToUnix("2026-01-23T20:43:39Z");
+    try std.testing.expectEqual(@as(i64, 1769293419), ts2);
+
+    // Test epoch
+    const ts3 = try parseIso8601ToUnix("1970-01-01T00:00:00Z");
+    try std.testing.expectEqual(@as(i64, 0), ts3);
 }
