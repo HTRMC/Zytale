@@ -82,15 +82,19 @@ pub fn writeUUID(buf: []u8, uuid: [16]u8) void {
 }
 
 /// Parse Connect packet (ID=0)
-/// Format from Java:
+/// Format from Java (new protocol):
 ///   nullBits: 1 byte
-///   protocolHash: 64 bytes fixed ASCII
+///   protocolCrc: 4 bytes i32 LE
+///   protocolBuildNumber: 4 bytes i32 LE
+///   clientVersion: 20 bytes fixed ASCII
 ///   clientType: 1 byte
 ///   uuid: 16 bytes
-///   [offset table: 5 x 4 bytes = 20 bytes, starting at offset 82]
-///   Variable block starts at offset 102
+///   [offset table: 5 x 4 bytes = 20 bytes, starting at offset 46]
+///   Variable block starts at offset 66
 pub const ConnectPacket = struct {
-    protocol_hash: []const u8,
+    protocol_crc: i32,
+    protocol_build_number: i32,
+    client_version: []const u8,
     client_type: u8,
     uuid: [16]u8,
     language: ?[]const u8,
@@ -98,22 +102,24 @@ pub const ConnectPacket = struct {
     username: []const u8,
 
     pub fn parse(data: []const u8) ?ConnectPacket {
-        // Minimum size is fixed block (82) + offset table (20) = 102
-        if (data.len < 102) return null;
+        // Minimum size is fixed block (46) + offset table (20) = 66
+        if (data.len < 66) return null;
 
         const null_bits = data[0];
-        const protocol_hash = readFixedAsciiString(data[1..], 64) orelse return null;
-        const client_type = data[65];
-        const uuid = readUUID(data[66..82]) orelse return null;
+        const protocol_crc = std.mem.readInt(i32, data[1..5], .little);
+        const protocol_build_number = std.mem.readInt(i32, data[5..9], .little);
+        const client_version = readFixedAsciiString(data[9..], 20) orelse return null;
+        const client_type = data[29];
+        const uuid = readUUID(data[30..46]) orelse return null;
 
         // Read offset table (little-endian i32 values)
-        const language_offset = std.mem.readInt(i32, data[82..86], .little);
-        const identity_token_offset = std.mem.readInt(i32, data[86..90], .little);
-        const username_offset = std.mem.readInt(i32, data[90..94], .little);
-        // referral_data_offset at 94..98
-        // referral_source_offset at 98..102
+        const language_offset = std.mem.readInt(i32, data[46..50], .little);
+        const identity_token_offset = std.mem.readInt(i32, data[50..54], .little);
+        const username_offset = std.mem.readInt(i32, data[54..58], .little);
+        // referral_data_offset at 58..62
+        // referral_source_offset at 62..66
 
-        const var_block_start: usize = 102;
+        const var_block_start: usize = 66;
 
         // Parse optional language (bit 0)
         var language: ?[]const u8 = null;
@@ -142,7 +148,9 @@ pub const ConnectPacket = struct {
         const username_result = readVarString(data[username_pos..]) orelse return null;
 
         return ConnectPacket{
-            .protocol_hash = protocol_hash,
+            .protocol_crc = protocol_crc,
+            .protocol_build_number = protocol_build_number,
+            .client_version = client_version,
             .client_type = client_type,
             .uuid = uuid,
             .language = language,
@@ -331,37 +339,46 @@ pub fn uuidToString(uuid: [16]u8) [36]u8 {
 }
 
 test "parse Connect packet" {
-    // Build a minimal Connect packet
-    var data: [120]u8 = undefined;
+    // Build a minimal Connect packet with new protocol format
+    var data: [80]u8 = undefined;
     @memset(&data, 0);
 
     // nullBits
     data[0] = 0x00; // no optional fields
 
-    // protocolHash (64 bytes fixed ASCII) - starts at offset 1
-    const hash = "6708f121966c1c443f4b0eb525b2f81d0a8dc61f5003a692a8fa157e5e02cea9";
-    @memcpy(data[1..65], hash);
+    // protocolCrc (4 bytes i32 LE) at offset 1
+    std.mem.writeInt(i32, data[1..5], 1789265863, .little);
 
-    // clientType at offset 65
-    data[65] = 0x00; // Game
+    // protocolBuildNumber (4 bytes i32 LE) at offset 5
+    std.mem.writeInt(i32, data[5..9], 2, .little);
 
-    // uuid at offset 66-81
-    @memset(data[66..82], 0xAB);
+    // clientVersion (20 bytes fixed ASCII) at offset 9
+    const version = "1.0.0";
+    @memcpy(data[9..14], version);
+    // rest is zero-padded
 
-    // Offset table at 82-101
-    std.mem.writeInt(i32, data[82..86], -1, .little); // language offset
-    std.mem.writeInt(i32, data[86..90], -1, .little); // identity token offset
-    std.mem.writeInt(i32, data[90..94], 0, .little); // username offset (relative to var block)
-    std.mem.writeInt(i32, data[94..98], -1, .little); // referral data offset
-    std.mem.writeInt(i32, data[98..102], -1, .little); // referral source offset
+    // clientType at offset 29
+    data[29] = 0x00; // Game
 
-    // Variable block at 102+
-    data[102] = 4; // VarInt: username length = 4
-    @memcpy(data[103..107], "Test");
+    // uuid at offset 30-45
+    @memset(data[30..46], 0xAB);
+
+    // Offset table at 46-65
+    std.mem.writeInt(i32, data[46..50], -1, .little); // language offset
+    std.mem.writeInt(i32, data[50..54], -1, .little); // identity token offset
+    std.mem.writeInt(i32, data[54..58], 0, .little); // username offset (relative to var block)
+    std.mem.writeInt(i32, data[58..62], -1, .little); // referral data offset
+    std.mem.writeInt(i32, data[62..66], -1, .little); // referral source offset
+
+    // Variable block at 66+
+    data[66] = 4; // VarInt: username length = 4
+    @memcpy(data[67..71], "Test");
 
     const result = ConnectPacket.parse(&data);
     try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings(hash, result.?.protocol_hash);
+    try std.testing.expectEqual(@as(i32, 1789265863), result.?.protocol_crc);
+    try std.testing.expectEqual(@as(i32, 2), result.?.protocol_build_number);
+    try std.testing.expectEqualStrings("1.0.0", result.?.client_version);
     try std.testing.expectEqualStrings("Test", result.?.username);
 }
 
