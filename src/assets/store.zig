@@ -303,6 +303,68 @@ pub const AssetStore = struct {
     pub fn isLoaded(self: *const Self) bool {
         return self.loaded;
     }
+
+    /// Iterate over files in a directory (by path prefix)
+    /// Returns an iterator that yields paths matching the prefix
+    pub fn iterateDirectory(self: *const Self, prefix: []const u8) DirectoryIterator {
+        return DirectoryIterator.init(self, prefix);
+    }
+
+    /// Iterator for files in a directory
+    pub const DirectoryIterator = struct {
+        store: *const AssetStore,
+        prefix: []const u8,
+        inner: std.StringHashMap(AssetInfo).Iterator,
+
+        pub fn init(store: *const AssetStore, prefix: []const u8) DirectoryIterator {
+            // Get a mutable reference to iterate (Zig HashMap requires this)
+            const mutable_store: *AssetStore = @constCast(store);
+            return .{
+                .store = store,
+                .prefix = prefix,
+                .inner = mutable_store.assets_by_path.iterator(),
+            };
+        }
+
+        pub fn next(self: *DirectoryIterator) ?AssetInfo {
+            while (self.inner.next()) |entry| {
+                const path = entry.key_ptr.*;
+                if (std.mem.startsWith(u8, path, self.prefix)) {
+                    return entry.value_ptr.*;
+                }
+            }
+            return null;
+        }
+
+        /// Reset the iterator to the beginning
+        pub fn reset(self: *DirectoryIterator) void {
+            const mutable_store: *AssetStore = @constCast(self.store);
+            self.inner = mutable_store.assets_by_path.iterator();
+        }
+    };
+
+    /// Count files in a directory (by path prefix)
+    pub fn countInDirectory(self: *const Self, prefix: []const u8) usize {
+        var count_val: usize = 0;
+        var iter = self.iterateDirectory(prefix);
+        while (iter.next()) |_| {
+            count_val += 1;
+        }
+        return count_val;
+    }
+
+    /// Get all file paths matching a prefix (allocates result)
+    pub fn getPathsInDirectory(self: *const Self, prefix: []const u8) !std.ArrayList([]const u8) {
+        var paths = std.ArrayList([]const u8).init(self.allocator);
+        errdefer paths.deinit();
+
+        var iter = self.iterateDirectory(prefix);
+        while (iter.next()) |info| {
+            try paths.append(info.path);
+        }
+
+        return paths;
+    }
 };
 
 /// Asset streaming chunk size (4MB as per plan)
