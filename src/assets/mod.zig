@@ -43,6 +43,29 @@ pub const AssetType = common.AssetType;
 pub const Color = common.Color;
 pub const ColorAlpha = common.ColorAlpha;
 
+// Asset type modules
+pub const audio_category = @import("types/audio_category.zig");
+pub const reverb_effect = @import("types/reverb_effect.zig");
+pub const equalizer_effect = @import("types/equalizer_effect.zig");
+pub const tag_pattern = @import("types/tag_pattern.zig");
+pub const trail = @import("types/trail.zig");
+
+// Asset types
+pub const AudioCategoryAsset = audio_category.AudioCategoryAsset;
+pub const ReverbEffectAsset = reverb_effect.ReverbEffectAsset;
+pub const EqualizerEffectAsset = equalizer_effect.EqualizerEffectAsset;
+pub const TagPatternAsset = tag_pattern.TagPatternAsset;
+pub const TagPatternType = tag_pattern.TagPatternType;
+pub const TrailAsset = trail.TrailAsset;
+pub const FXRenderMode = trail.FXRenderMode;
+pub const EdgeData = trail.EdgeData;
+
+// JSON parsing utilities
+pub const json = @import("json.zig");
+pub const dbToLinear = json.dbToLinear;
+pub const linearToDb = json.linearToDb;
+pub const extractAssetId = json.extractAssetId;
+
 // Data structures
 pub const IndexedAssetMap = @import("indexed_map.zig").IndexedAssetMap;
 

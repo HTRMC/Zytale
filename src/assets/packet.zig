@@ -14,7 +14,22 @@ const std = @import("std");
 const common = @import("types/common.zig");
 const serializer = @import("../protocol/packets/serializer.zig");
 
+// Asset type imports
+const audio_category = @import("types/audio_category.zig");
+const reverb_effect = @import("types/reverb_effect.zig");
+const equalizer_effect = @import("types/equalizer_effect.zig");
+const tag_pattern = @import("types/tag_pattern.zig");
+const trail = @import("types/trail.zig");
+
 const UpdateType = common.UpdateType;
+pub const AudioCategoryAssetType = audio_category.AudioCategoryAsset;
+pub const ReverbEffectAssetType = reverb_effect.ReverbEffectAsset;
+pub const EqualizerEffectAssetType = equalizer_effect.EqualizerEffectAsset;
+pub const TagPatternAssetType = tag_pattern.TagPatternAsset;
+pub const TagPatternType = tag_pattern.TagPatternType;
+pub const TrailAssetType = trail.TrailAsset;
+pub const FXRenderMode = trail.FXRenderMode;
+pub const EdgeData = trail.EdgeData;
 
 /// Write a VarInt to buffer, returns bytes written
 pub fn writeVarInt(buf: []u8, value: u32) usize {
@@ -202,6 +217,248 @@ pub fn serializeEnvironment(allocator: std.mem.Allocator, entry: *const Environm
 
     // tagIndexes offset (not implemented, set to -1)
     std.mem.writeInt(i32, writer.items[offset_start + 8 ..][0..4], -1, .little);
+}
+
+/// Serialize ReverbEffect
+/// Format from Java: nullBits(1) + 13 f32s(52) + bool(1) + [id VarString if nullBits & 1]
+/// FIXED_BLOCK_SIZE = 54, NO offset - id is inline
+pub fn serializeReverbEffect(allocator: std.mem.Allocator, entry: *const ReverbEffectAssetType, writer: *std.ArrayListUnmanaged(u8)) !void {
+    // nullBits: bit 0 = id present
+    const has_id: u8 = if (entry.id.len > 0) 0x01 else 0x00;
+    try writer.append(allocator, has_id);
+
+    // 13 f32 values (52 bytes) in exact order from Java
+    try writeF32(allocator, writer, entry.dry_gain);
+    try writeF32(allocator, writer, entry.modal_density);
+    try writeF32(allocator, writer, entry.diffusion);
+    try writeF32(allocator, writer, entry.gain);
+    try writeF32(allocator, writer, entry.high_frequency_gain);
+    try writeF32(allocator, writer, entry.decay_time);
+    try writeF32(allocator, writer, entry.high_frequency_decay_ratio);
+    try writeF32(allocator, writer, entry.reflection_gain);
+    try writeF32(allocator, writer, entry.reflection_delay);
+    try writeF32(allocator, writer, entry.late_reverb_gain);
+    try writeF32(allocator, writer, entry.late_reverb_delay);
+    try writeF32(allocator, writer, entry.room_rolloff_factor);
+    try writeF32(allocator, writer, entry.air_absorption_hf_gain);
+
+    // bool (1 byte)
+    try writer.append(allocator, if (entry.limit_decay_high_frequency) @as(u8, 1) else @as(u8, 0));
+
+    // id VarString (inline, no offset!) - only if present
+    if (entry.id.len > 0) {
+        try writeVarString(allocator, writer, entry.id);
+    }
+}
+
+/// Serialize EqualizerEffect
+/// Format from Java: nullBits(1) + 10 f32s(40) + [id VarString if nullBits & 1]
+/// FIXED_BLOCK_SIZE = 41, NO offset - id is inline
+pub fn serializeEqualizerEffect(allocator: std.mem.Allocator, entry: *const EqualizerEffectAssetType, writer: *std.ArrayListUnmanaged(u8)) !void {
+    // nullBits: bit 0 = id present
+    const has_id: u8 = if (entry.id.len > 0) 0x01 else 0x00;
+    try writer.append(allocator, has_id);
+
+    // 10 f32 values (40 bytes) in exact order from Java
+    try writeF32(allocator, writer, entry.low_gain);
+    try writeF32(allocator, writer, entry.low_cut_off);
+    try writeF32(allocator, writer, entry.low_mid_gain);
+    try writeF32(allocator, writer, entry.low_mid_center);
+    try writeF32(allocator, writer, entry.low_mid_width);
+    try writeF32(allocator, writer, entry.high_mid_gain);
+    try writeF32(allocator, writer, entry.high_mid_center);
+    try writeF32(allocator, writer, entry.high_mid_width);
+    try writeF32(allocator, writer, entry.high_gain);
+    try writeF32(allocator, writer, entry.high_cut_off);
+
+    // id VarString (inline, no offset!) - only if present
+    if (entry.id.len > 0) {
+        try writeVarString(allocator, writer, entry.id);
+    }
+}
+
+/// Serialize TagPattern
+/// Format from Java: nullBits(1) + type(1) + tagIndex(4) + operandsOffset(4) + notOffset(4) + [variable]
+/// FIXED_BLOCK_SIZE = 6, VARIABLE_BLOCK_START = 14
+/// NOTE: TagPattern has NO id field in the protocol!
+pub fn serializeTagPattern(allocator: std.mem.Allocator, entry: *const TagPatternAssetType, writer: *std.ArrayListUnmanaged(u8)) !void {
+    try serializeTagPatternRecursive(allocator, entry, writer);
+}
+
+fn serializeTagPatternRecursive(allocator: std.mem.Allocator, entry: *const TagPatternAssetType, writer: *std.ArrayListUnmanaged(u8)) !void {
+    const entry_start = writer.items.len;
+
+    // nullBits: bit 0 = operands present, bit 1 = not present
+    var null_bits: u8 = 0;
+    if (entry.operands != null) null_bits |= 0x01;
+    if (entry.not_pattern != null) null_bits |= 0x02;
+    try writer.append(allocator, null_bits);
+
+    // type (1 byte)
+    try writer.append(allocator, @intFromEnum(entry.type));
+
+    // tagIndex (4 bytes)
+    try writeI32(allocator, writer, entry.tag_index);
+
+    // operandsOffset placeholder (4 bytes) - offset 6
+    const operands_offset_pos = writer.items.len;
+    try writer.appendNTimes(allocator, 0, 4);
+
+    // notOffset placeholder (4 bytes) - offset 10
+    const not_offset_pos = writer.items.len;
+    try writer.appendNTimes(allocator, 0, 4);
+
+    // Variable block starts at offset 14 from entry_start
+    const var_block_start = entry_start + 14;
+
+    // operands (if present)
+    if (entry.operands) |operands| {
+        // Write offset relative to var_block_start
+        const operands_offset: i32 = @intCast(writer.items.len - var_block_start);
+        std.mem.writeInt(i32, writer.items[operands_offset_pos..][0..4], operands_offset, .little);
+
+        // Write VarInt count
+        var count_buf: [5]u8 = undefined;
+        const count_len = writeVarInt(&count_buf, @intCast(operands.len));
+        try writer.appendSlice(allocator, count_buf[0..count_len]);
+
+        // Write each operand recursively
+        for (operands) |*op| {
+            try serializeTagPatternRecursive(allocator, op, writer);
+        }
+    } else {
+        std.mem.writeInt(i32, writer.items[operands_offset_pos..][0..4], -1, .little);
+    }
+
+    // not (if present)
+    if (entry.not_pattern) |np| {
+        // Write offset relative to var_block_start
+        const not_offset: i32 = @intCast(writer.items.len - var_block_start);
+        std.mem.writeInt(i32, writer.items[not_offset_pos..][0..4], not_offset, .little);
+
+        // Write the not pattern recursively
+        try serializeTagPatternRecursive(allocator, np, writer);
+    } else {
+        std.mem.writeInt(i32, writer.items[not_offset_pos..][0..4], -1, .little);
+    }
+}
+
+/// Serialize Trail
+/// Format from Java:
+/// nullBits(1) + lifeSpan(4) + roll(4) + start Edge(9) + end Edge(9) + lightInfluence(4) +
+/// renderMode(1) + intersectionHighlight(8) + smooth(1) + frameSize(8) + frameRange(8) +
+/// frameLifeSpan(4) + idOffset(4) + textureOffset(4) + [variable]
+/// FIXED_BLOCK_SIZE = 61, VARIABLE_BLOCK_START = 69
+pub fn serializeTrail(allocator: std.mem.Allocator, entry: *const TrailAssetType, writer: *std.ArrayListUnmanaged(u8)) !void {
+    const entry_start = writer.items.len;
+
+    // nullBits
+    var null_bits: u8 = 0;
+    if (entry.id.len > 0) null_bits |= 0x01;
+    if (entry.texture.len > 0) null_bits |= 0x02;
+    if (entry.start != null) null_bits |= 0x04;
+    if (entry.end != null) null_bits |= 0x08;
+    // bit 4 = intersectionHighlight (not implemented, always 0)
+    // bit 5 = frameSize (not implemented, always 0)
+    // bit 6 = frameRange (not implemented, always 0)
+    try writer.append(allocator, null_bits);
+
+    // lifeSpan (i32)
+    try writeI32(allocator, writer, entry.life_span);
+
+    // roll (f32)
+    try writeF32(allocator, writer, entry.roll);
+
+    // start Edge (9 bytes) - nullBits(1) + color(4) + width(4)
+    if (entry.start) |start| {
+        // Edge nullBits: bit 0 = color present
+        try writer.append(allocator, 0x01); // color always present
+        // ColorAlpha (4 bytes RGBA)
+        try writer.append(allocator, start.color.r);
+        try writer.append(allocator, start.color.g);
+        try writer.append(allocator, start.color.b);
+        try writer.append(allocator, start.color.a);
+        // width (f32)
+        try writeF32(allocator, writer, start.size);
+    } else {
+        try writer.appendNTimes(allocator, 0, 9);
+    }
+
+    // end Edge (9 bytes)
+    if (entry.end) |end| {
+        try writer.append(allocator, 0x01);
+        try writer.append(allocator, end.color.r);
+        try writer.append(allocator, end.color.g);
+        try writer.append(allocator, end.color.b);
+        try writer.append(allocator, end.color.a);
+        try writeF32(allocator, writer, end.size);
+    } else {
+        try writer.appendNTimes(allocator, 0, 9);
+    }
+
+    // lightInfluence (f32)
+    try writeF32(allocator, writer, entry.light_influence);
+
+    // renderMode (u8)
+    try writer.append(allocator, @intFromEnum(entry.render_mode));
+
+    // intersectionHighlight (8 bytes) - not implemented, write zeros
+    try writer.appendNTimes(allocator, 0, 8);
+
+    // smooth (bool)
+    try writer.append(allocator, if (entry.smooth) @as(u8, 1) else @as(u8, 0));
+
+    // frameSize Vector2i (8 bytes) - not implemented, write zeros
+    try writer.appendNTimes(allocator, 0, 8);
+
+    // frameRange Range (8 bytes) - not implemented, write zeros
+    try writer.appendNTimes(allocator, 0, 8);
+
+    // frameLifeSpan (i32)
+    try writeI32(allocator, writer, entry.frame_life_span);
+
+    // idOffset placeholder (4 bytes) - offset 61
+    const id_offset_pos = writer.items.len;
+    try writer.appendNTimes(allocator, 0, 4);
+
+    // textureOffset placeholder (4 bytes) - offset 65
+    const texture_offset_pos = writer.items.len;
+    try writer.appendNTimes(allocator, 0, 4);
+
+    // Variable block starts at offset 69 from entry_start
+    const var_block_start = entry_start + 69;
+
+    // id VarString (if present)
+    if (entry.id.len > 0) {
+        const id_offset: i32 = @intCast(writer.items.len - var_block_start);
+        std.mem.writeInt(i32, writer.items[id_offset_pos..][0..4], id_offset, .little);
+        try writeVarString(allocator, writer, entry.id);
+    } else {
+        std.mem.writeInt(i32, writer.items[id_offset_pos..][0..4], -1, .little);
+    }
+
+    // texture VarString (if present)
+    if (entry.texture.len > 0) {
+        const texture_offset: i32 = @intCast(writer.items.len - var_block_start);
+        std.mem.writeInt(i32, writer.items[texture_offset_pos..][0..4], texture_offset, .little);
+        try writeVarString(allocator, writer, entry.texture);
+    } else {
+        std.mem.writeInt(i32, writer.items[texture_offset_pos..][0..4], -1, .little);
+    }
+}
+
+/// Helper to write f32 as little-endian bytes
+fn writeF32(allocator: std.mem.Allocator, writer: *std.ArrayListUnmanaged(u8), value: f32) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, &buf, @bitCast(value), .little);
+    try writer.appendSlice(allocator, &buf);
+}
+
+/// Helper to write i32 as little-endian bytes
+fn writeI32(allocator: std.mem.Allocator, writer: *std.ArrayListUnmanaged(u8), value: i32) !void {
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(i32, &buf, value, .little);
+    try writer.appendSlice(allocator, &buf);
 }
 
 /// Build an empty Update* packet with proper format
