@@ -11,8 +11,9 @@ const Connection = @import("connection.zig").Connection;
 
 const log = std.log.scoped(.stream);
 
-/// Expected protocol hash from Java server
-const EXPECTED_PROTOCOL_HASH = "6708f121966c1c443f4b0eb525b2f81d0a8dc61f5003a692a8fa157e5e02cea9";
+/// Expected protocol constants from Java server
+const EXPECTED_PROTOCOL_CRC: i32 = 1789265863;
+const EXPECTED_PROTOCOL_BUILD: i32 = 2;
 
 /// Connection phase for the protocol state machine
 pub const ConnectionPhase = enum {
@@ -174,17 +175,24 @@ pub const Stream = struct {
         // Log parsed data
         const uuid_str = serializer.uuidToString(connect.uuid);
         log.info("Connect from: username={s}, uuid={s}", .{ connect.username, &uuid_str });
-        log.info("Protocol hash: {s}", .{connect.protocol_hash});
+        log.info("Protocol CRC: {d}, Build: {d}, Client Version: {s}", .{ connect.protocol_crc, connect.protocol_build_number, connect.client_version });
         if (connect.language) |lang| {
             log.info("Language: {s}", .{lang});
         }
 
-        // Validate protocol hash
-        if (!std.mem.eql(u8, connect.protocol_hash, EXPECTED_PROTOCOL_HASH)) {
-            log.err("Protocol hash mismatch!", .{});
-            log.err("Expected: {s}", .{EXPECTED_PROTOCOL_HASH});
-            log.err("Got:      {s}", .{connect.protocol_hash});
-            self.sendDisconnect("Incompatible protocol version") catch {};
+        // Validate protocol CRC and build number
+        if (connect.protocol_crc != EXPECTED_PROTOCOL_CRC or connect.protocol_build_number != EXPECTED_PROTOCOL_BUILD) {
+            if (connect.protocol_build_number < EXPECTED_PROTOCOL_BUILD) {
+                log.err("Client protocol outdated!", .{});
+                log.err("Expected build: {d}, Got: {d}", .{ EXPECTED_PROTOCOL_BUILD, connect.protocol_build_number });
+                // Error code 5 = client older than server
+                self.sendDisconnect("Client outdated - please update") catch {};
+            } else {
+                log.err("Server protocol outdated!", .{});
+                log.err("Expected build: {d}, Got: {d}", .{ EXPECTED_PROTOCOL_BUILD, connect.protocol_build_number });
+                // Error code 6 = server older than client
+                self.sendDisconnect("Server outdated") catch {};
+            }
             return;
         }
 

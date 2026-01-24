@@ -31,7 +31,7 @@ pub const ServerConfig = struct {
     view_radius: u32 = 6,
 
     /// Application-Layer Protocol Negotiation identifier
-    alpn: []const u8 = "hytale/1",
+    alpn: []const u8 = "hytale/2",
 };
 
 /// Hytale QUIC Server

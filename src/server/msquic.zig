@@ -670,7 +670,7 @@ pub fn makeAlpn(comptime alpn: []const u8) QUIC_BUFFER {
 }
 
 // ALPN for Hytale protocol
-pub const HYTALE_ALPN = "hytale/1";
+pub const HYTALE_ALPN = "hytale/2";
 
 test "msquic status helpers" {
     try std.testing.expect(QUIC_SUCCEEDED(QUIC_STATUS_SUCCESS));
