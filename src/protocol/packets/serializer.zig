@@ -83,13 +83,18 @@ pub fn writeUUID(buf: []u8, uuid: [16]u8) void {
 
 /// Parse Connect packet (ID=0)
 /// Format from Java (new protocol):
-///   nullBits: 1 byte
+///   nullBits: 1 byte (bit 0=identityToken, bit 1=referralData, bit 2=referralSource)
 ///   protocolCrc: 4 bytes i32 LE
 ///   protocolBuildNumber: 4 bytes i32 LE
 ///   clientVersion: 20 bytes fixed ASCII
 ///   clientType: 1 byte
 ///   uuid: 16 bytes
-///   [offset table: 5 x 4 bytes = 20 bytes, starting at offset 46]
+///   Offset table at 46 (5 x i32 LE = 20 bytes):
+///     46: username offset (required)
+///     50: identityToken offset (optional, bit 0)
+///     54: language offset (required)
+///     58: referralData offset (optional, bit 1)
+///     62: referralSource offset (optional, bit 2)
 ///   Variable block starts at offset 66
 pub const ConnectPacket = struct {
     protocol_crc: i32,
@@ -113,27 +118,24 @@ pub const ConnectPacket = struct {
         const uuid = readUUID(data[30..46]) orelse return null;
 
         // Read offset table (little-endian i32 values)
-        const language_offset = std.mem.readInt(i32, data[46..50], .little);
+        // Order from Java: username at 46, identityToken at 50, language at 54
+        const username_offset = std.mem.readInt(i32, data[46..50], .little);
         const identity_token_offset = std.mem.readInt(i32, data[50..54], .little);
-        const username_offset = std.mem.readInt(i32, data[54..58], .little);
+        const language_offset = std.mem.readInt(i32, data[54..58], .little);
         // referral_data_offset at 58..62
         // referral_source_offset at 62..66
 
         const var_block_start: usize = 66;
 
-        // Parse optional language (bit 0)
-        var language: ?[]const u8 = null;
-        if ((null_bits & 1) != 0 and language_offset >= 0) {
-            const pos = var_block_start + @as(usize, @intCast(language_offset));
-            if (pos < data.len) {
-                const vs = readVarString(data[pos..]) orelse return null;
-                language = vs.value;
-            }
-        }
+        // Parse username (required, always present)
+        if (username_offset < 0) return null;
+        const username_pos = var_block_start + @as(usize, @intCast(username_offset));
+        if (username_pos >= data.len) return null;
+        const username_result = readVarString(data[username_pos..]) orelse return null;
 
-        // Parse optional identity token (bit 1)
+        // Parse optional identity token (bit 0)
         var identity_token: ?[]const u8 = null;
-        if ((null_bits & 2) != 0 and identity_token_offset >= 0) {
+        if ((null_bits & 1) != 0 and identity_token_offset >= 0) {
             const pos = var_block_start + @as(usize, @intCast(identity_token_offset));
             if (pos < data.len) {
                 const vs = readVarString(data[pos..]) orelse return null;
@@ -141,11 +143,15 @@ pub const ConnectPacket = struct {
             }
         }
 
-        // Parse username (required)
-        if (username_offset < 0) return null;
-        const username_pos = var_block_start + @as(usize, @intCast(username_offset));
-        if (username_pos >= data.len) return null;
-        const username_result = readVarString(data[username_pos..]) orelse return null;
+        // Parse language (required, always present)
+        var language: ?[]const u8 = null;
+        if (language_offset >= 0) {
+            const pos = var_block_start + @as(usize, @intCast(language_offset));
+            if (pos < data.len) {
+                const vs = readVarString(data[pos..]) orelse return null;
+                language = vs.value;
+            }
+        }
 
         return ConnectPacket{
             .protocol_crc = protocol_crc,
