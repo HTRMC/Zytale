@@ -77,8 +77,8 @@ pub const GeneratedPacket = @import("registry.zig").GeneratedPacket;
 pub const AssetStore = @import("store.zig").AssetStore;
 pub const AssetInfo = @import("store.zig").AssetInfo;
 
-// Packet serialization
-pub const packet = @import("packet.zig");
+// Packet serialization (migrated to protocol/packets/assets/)
+pub const packets = @import("../protocol/packets/assets/mod.zig");
 
 // Helper function to get ZIP path for an asset type
 pub const getZipPath = common.getZipPath;
