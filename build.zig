@@ -88,4 +88,27 @@ pub fn build(b: *std.Build) void {
         const run_test = b.addRunArtifact(unit_test);
         test_step.dependOn(&run_test.step);
     }
+
+    // Assets module tests (includes packet.zig with serializer tests)
+    // Note: packet.zig imports serializer from protocol, so we need to inline those functions
+    // or test through main. For now, we test through the main module.
+    const main_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "protocol", .module = protocol_module },
+            },
+        }),
+    });
+
+    if (target.result.os.tag == .windows) {
+        main_test.root_module.linkSystemLibrary("ws2_32", .{});
+        main_test.root_module.linkSystemLibrary("crypt32", .{});
+        main_test.root_module.linkSystemLibrary("ncrypt", .{});
+    }
+
+    const run_main_test = b.addRunArtifact(main_test);
+    test_step.dependOn(&run_main_test.step);
 }

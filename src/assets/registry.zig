@@ -577,15 +577,16 @@ pub const AssetRegistry = struct {
     }
 
     fn generateTrailsPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
-        const S = packet.AssetSerializer(packet.TrailAssetType);
+        // UpdateTrails uses string keys (Map<String, Trail>) NOT integer keys!
+        const S = packet.StringKeyedSerializer(packet.TrailAssetType);
 
-        var entries: std.ArrayList(S.IndexedEntry) = .empty;
+        var entries: std.ArrayList(S.StringKeyedEntry) = .empty;
         defer entries.deinit(self.allocator);
 
         var iter = self.trails.constIterator();
         while (iter.next()) |entry| {
             try entries.append(self.allocator, .{
-                .index = entry.index,
+                .key = entry.value.id, // Use the trail's ID as the string key
                 .value = entry.value,
             });
         }
@@ -593,9 +594,7 @@ pub const AssetRegistry = struct {
         const payload = try S.serialize(
             self.allocator,
             .init,
-            @intCast(self.trails.maxId()),
             entries.items,
-            &[_]u8{},
             packet.serializeTrail,
         );
 

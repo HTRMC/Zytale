@@ -139,3 +139,8 @@ test "basic test" {
     const result = std.fmt.parseInt(u16, "5520", 10);
     try std.testing.expectEqual(@as(u16, 5520), result catch unreachable);
 }
+
+test {
+    // Discover and run all tests in submodules
+    @import("std").testing.refAllDecls(@import("assets/mod.zig"));
+}
