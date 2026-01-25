@@ -6,9 +6,12 @@
 const std = @import("std");
 const common = @import("types/common.zig");
 const IndexedAssetMap = @import("indexed_map.zig").IndexedAssetMap;
-const packet = @import("packet.zig");
 const store = @import("store.zig");
 const json = @import("json.zig");
+
+// Asset packet imports from protocol/packets/assets/
+const asset_packets = @import("../protocol/packets/assets/mod.zig");
+const serializer = asset_packets.serializer;
 
 // Asset type imports
 const audio_category = @import("types/audio_category.zig");
@@ -16,6 +19,7 @@ const reverb_effect = @import("types/reverb_effect.zig");
 const equalizer_effect = @import("types/equalizer_effect.zig");
 const tag_pattern = @import("types/tag_pattern.zig");
 const trail = @import("types/trail.zig");
+const entity_effect = @import("types/entity_effect.zig");
 
 const log = std.log.scoped(.asset_registry);
 
@@ -26,25 +30,6 @@ const AssetType = common.AssetType;
 const AudioCategoryEntry = struct {
     id: []const u8,
     volume: f32,
-};
-
-/// Simple struct for reverb packet serialization
-const ReverbEffectEntry = struct {
-    id: []const u8,
-    dry_gain: f32,
-    modal_density: f32,
-    diffusion: f32,
-    gain: f32,
-    high_frequency_gain: f32,
-    decay_time: f32,
-    high_frequency_decay_ratio: f32,
-    reflection_gain: f32,
-    reflection_delay: f32,
-    late_reverb_gain: f32,
-    late_reverb_delay: f32,
-    room_rolloff_factor: f32,
-    air_absorption_hf_gain: f32,
-    limit_decay_high_frequency: bool,
 };
 
 /// AssetRegistry holds all loaded assets and generates packets
@@ -70,7 +55,10 @@ pub const AssetRegistry = struct {
     trails: IndexedAssetMap(trail.TrailAsset),
 
     /// Environments
-    environments: IndexedAssetMap(packet.EnvironmentAsset),
+    environments: IndexedAssetMap(asset_packets.UpdateEnvironments.EnvironmentAsset),
+
+    /// Entity effects
+    entity_effects: IndexedAssetMap(entity_effect.EntityEffectAsset),
 
     /// Whether assets have been loaded
     loaded: bool,
@@ -89,7 +77,8 @@ pub const AssetRegistry = struct {
             .equalizer_effects = IndexedAssetMap(equalizer_effect.EqualizerEffectAsset).init(allocator),
             .tag_patterns = IndexedAssetMap(tag_pattern.TagPatternAsset).init(allocator),
             .trails = IndexedAssetMap(trail.TrailAsset).init(allocator),
-            .environments = IndexedAssetMap(packet.EnvironmentAsset).init(allocator),
+            .environments = IndexedAssetMap(asset_packets.UpdateEnvironments.EnvironmentAsset).init(allocator),
+            .entity_effects = IndexedAssetMap(entity_effect.EntityEffectAsset).init(allocator),
             .loaded = false,
             .total_assets = 0,
         };
@@ -136,6 +125,13 @@ pub const AssetRegistry = struct {
         }
         self.trails.deinit();
 
+        var effect_iter = self.entity_effects.iterator();
+        while (effect_iter.next()) |entry| {
+            var asset = entry.value.*;
+            asset.deinit(self.allocator);
+        }
+        self.entity_effects.deinit();
+
         self.environments.deinit();
     }
 
@@ -160,6 +156,7 @@ pub const AssetRegistry = struct {
         try self.loadEqualizerEffectsFromZip();
         try self.loadTagPatternsFromZip();
         try self.loadTrailsFromZip();
+        try self.loadEntityEffectsFromZip();
 
         // Load placeholder for environments (JSON parsing not implemented yet)
         try self.loadPlaceholderEnvironments();
@@ -382,6 +379,48 @@ pub const AssetRegistry = struct {
         log.info("Loaded {d} Trails", .{loaded});
     }
 
+    /// Load EntityEffects from ZIP
+    fn loadEntityEffectsFromZip(self: *Self) !void {
+        const asset_store_ptr = &self.asset_store.?;
+        const prefix = common.getZipPath(.entity_effects);
+
+        var iter = asset_store_ptr.iterateDirectory(prefix);
+        var loaded: usize = 0;
+
+        while (iter.next()) |info| {
+            if (!std.mem.endsWith(u8, info.path, ".json")) continue;
+
+            const content = asset_store_ptr.readAsset(info.path) catch |err| {
+                log.warn("Failed to read {s}: {}", .{ info.path, err });
+                continue;
+            };
+            defer self.allocator.free(content);
+
+            const asset_id = json.extractAssetId(self.allocator, info.path) catch |err| {
+                log.warn("Failed to extract ID from {s}: {}", .{ info.path, err });
+                continue;
+            };
+            defer self.allocator.free(asset_id);
+
+            const asset = entity_effect.EntityEffectAsset.parseJson(self.allocator, asset_id, content) catch |err| {
+                log.warn("Failed to parse {s}: {}", .{ info.path, err });
+                continue;
+            };
+
+            _ = self.entity_effects.put(asset.id, asset) catch |err| {
+                log.warn("Failed to store {s}: {}", .{ asset_id, err });
+                var mutable_asset = asset;
+                mutable_asset.deinit(self.allocator);
+                continue;
+            };
+
+            loaded += 1;
+        }
+
+        self.total_assets += loaded;
+        log.info("Loaded {d} EntityEffects", .{loaded});
+    }
+
     /// Load placeholder environments
     fn loadPlaceholderEnvironments(self: *Self) !void {
         _ = try self.environments.put("default", .{
@@ -433,6 +472,7 @@ pub const AssetRegistry = struct {
         try self.generateTagPatternsPacket(&packets);
         try self.generateTrailsPacket(&packets);
         try self.generateEnvironmentsPacket(&packets);
+        try self.generateEntityEffectsPacket(&packets);
 
         // Generate empty packets for all other required asset types
         try self.generateEmptyPackets(&packets);
@@ -441,7 +481,7 @@ pub const AssetRegistry = struct {
     }
 
     fn generateAudioCategoriesPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
-        const S = packet.AssetSerializer(packet.AudioCategoryAsset);
+        const S = serializer.AssetSerializer(asset_packets.UpdateAudioCategories.AudioCategoryEntry);
 
         var entries: std.ArrayList(S.IndexedEntry) = .empty;
         defer entries.deinit(self.allocator);
@@ -454,17 +494,15 @@ pub const AssetRegistry = struct {
             });
         }
 
-        const payload = try S.serialize(
+        const payload = try asset_packets.UpdateAudioCategories.serialize(
             self.allocator,
             .init,
             @intCast(self.audio_categories.maxId()),
             entries.items,
-            &[_]u8{},
-            packet.serializeAudioCategory,
         );
 
         try packets.append(self.allocator, .{
-            .packet_id = AssetType.audio_categories.getPacketId(),
+            .packet_id = asset_packets.UpdateAudioCategories.PACKET_ID,
             .payload = payload,
         });
 
@@ -475,7 +513,7 @@ pub const AssetRegistry = struct {
     }
 
     fn generateReverbEffectsPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
-        const S = packet.AssetSerializer(packet.ReverbEffectAssetType);
+        const S = serializer.AssetSerializer(reverb_effect.ReverbEffectAsset);
 
         var entries: std.ArrayList(S.IndexedEntry) = .empty;
         defer entries.deinit(self.allocator);
@@ -488,17 +526,15 @@ pub const AssetRegistry = struct {
             });
         }
 
-        const payload = try S.serialize(
+        const payload = try asset_packets.UpdateReverbEffects.serialize(
             self.allocator,
             .init,
             @intCast(self.reverb_effects.maxId()),
             entries.items,
-            &[_]u8{},
-            packet.serializeReverbEffect,
         );
 
         try packets.append(self.allocator, .{
-            .packet_id = AssetType.reverb_effects.getPacketId(),
+            .packet_id = asset_packets.UpdateReverbEffects.PACKET_ID,
             .payload = payload,
         });
 
@@ -509,7 +545,7 @@ pub const AssetRegistry = struct {
     }
 
     fn generateEqualizerEffectsPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
-        const S = packet.AssetSerializer(packet.EqualizerEffectAssetType);
+        const S = serializer.AssetSerializer(equalizer_effect.EqualizerEffectAsset);
 
         var entries: std.ArrayList(S.IndexedEntry) = .empty;
         defer entries.deinit(self.allocator);
@@ -522,17 +558,15 @@ pub const AssetRegistry = struct {
             });
         }
 
-        const payload = try S.serialize(
+        const payload = try asset_packets.UpdateEqualizerEffects.serialize(
             self.allocator,
             .init,
             @intCast(self.equalizer_effects.maxId()),
             entries.items,
-            &[_]u8{},
-            packet.serializeEqualizerEffect,
         );
 
         try packets.append(self.allocator, .{
-            .packet_id = AssetType.equalizer_effects.getPacketId(),
+            .packet_id = asset_packets.UpdateEqualizerEffects.PACKET_ID,
             .payload = payload,
         });
 
@@ -543,7 +577,7 @@ pub const AssetRegistry = struct {
     }
 
     fn generateTagPatternsPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
-        const S = packet.AssetSerializer(packet.TagPatternAssetType);
+        const S = serializer.AssetSerializer(tag_pattern.TagPatternAsset);
 
         var entries: std.ArrayList(S.IndexedEntry) = .empty;
         defer entries.deinit(self.allocator);
@@ -556,17 +590,15 @@ pub const AssetRegistry = struct {
             });
         }
 
-        const payload = try S.serialize(
+        const payload = try asset_packets.UpdateTagPatterns.serialize(
             self.allocator,
             .init,
             @intCast(self.tag_patterns.maxId()),
             entries.items,
-            &[_]u8{},
-            packet.serializeTagPattern,
         );
 
         try packets.append(self.allocator, .{
-            .packet_id = AssetType.tag_patterns.getPacketId(),
+            .packet_id = asset_packets.UpdateTagPatterns.PACKET_ID,
             .payload = payload,
         });
 
@@ -578,7 +610,7 @@ pub const AssetRegistry = struct {
 
     fn generateTrailsPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
         // UpdateTrails uses string keys (Map<String, Trail>) NOT integer keys!
-        const S = packet.StringKeyedSerializer(packet.TrailAssetType);
+        const S = serializer.StringKeyedSerializer(trail.TrailAsset);
 
         var entries: std.ArrayList(S.StringKeyedEntry) = .empty;
         defer entries.deinit(self.allocator);
@@ -591,15 +623,14 @@ pub const AssetRegistry = struct {
             });
         }
 
-        const payload = try S.serialize(
+        const payload = try asset_packets.UpdateTrails.serialize(
             self.allocator,
             .init,
             entries.items,
-            packet.serializeTrail,
         );
 
         try packets.append(self.allocator, .{
-            .packet_id = AssetType.trails.getPacketId(),
+            .packet_id = asset_packets.UpdateTrails.PACKET_ID,
             .payload = payload,
         });
 
@@ -610,7 +641,7 @@ pub const AssetRegistry = struct {
     }
 
     fn generateEnvironmentsPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
-        const S = packet.AssetSerializer(packet.EnvironmentAsset);
+        const S = serializer.AssetSerializer(asset_packets.UpdateEnvironments.EnvironmentAsset);
 
         var entries: std.ArrayList(S.IndexedEntry) = .empty;
         defer entries.deinit(self.allocator);
@@ -620,19 +651,15 @@ pub const AssetRegistry = struct {
             try entries.append(self.allocator, .{ .index = entry.index, .value = entry.value });
         }
 
-        const extra_bytes = [_]u8{0}; // rebuildMapGeometry = false
-
-        const payload = try S.serialize(
+        const payload = try asset_packets.UpdateEnvironments.serialize(
             self.allocator,
             .init,
             @intCast(self.environments.maxId()),
             entries.items,
-            &extra_bytes,
-            packet.serializeEnvironment,
         );
 
         try packets.append(self.allocator, .{
-            .packet_id = AssetType.environments.getPacketId(),
+            .packet_id = asset_packets.UpdateEnvironments.PACKET_ID,
             .payload = payload,
         });
 
@@ -642,29 +669,40 @@ pub const AssetRegistry = struct {
         });
     }
 
+    fn generateEntityEffectsPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
+        const S = serializer.AssetSerializer(entity_effect.EntityEffectAsset);
+
+        var entries: std.ArrayList(S.IndexedEntry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        var iter = self.entity_effects.constIterator();
+        while (iter.next()) |entry| {
+            try entries.append(self.allocator, .{
+                .index = entry.index,
+                .value = entry.value,
+            });
+        }
+
+        const payload = try asset_packets.UpdateEntityEffects.serialize(
+            self.allocator,
+            .init,
+            @intCast(self.entity_effects.maxId()),
+            entries.items,
+        );
+
+        try packets.append(self.allocator, .{
+            .packet_id = asset_packets.UpdateEntityEffects.PACKET_ID,
+            .payload = payload,
+        });
+
+        log.debug("Generated UpdateEntityEffects: {d} entries, {d} bytes", .{
+            entries.items.len,
+            payload.len,
+        });
+    }
+
     /// Generate empty packets for all required asset types not yet implemented
     fn generateEmptyPackets(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
-        // Debug: Helper to print hex dump for specific asset types
-        const debugHexDump = struct {
-            fn dump(asset_type: AssetType, payload: []const u8) void {
-                // Only dump for debugging specific packets
-                if (asset_type == .entity_effects or
-                    asset_type == .block_sound_sets or
-                    asset_type == .item_player_animations)
-                {
-                    std.debug.print("DEBUG {s} (ID {d}, {d} bytes): ", .{
-                        @tagName(asset_type),
-                        asset_type.getPacketId(),
-                        payload.len,
-                    });
-                    for (payload) |b| {
-                        std.debug.print("{x:0>2} ", .{b});
-                    }
-                    std.debug.print("\n", .{});
-                }
-            }
-        }.dump;
-
         // Asset types that still need empty packets (not implemented yet)
         const all_types = [_]AssetType{
             .block_types,
@@ -678,7 +716,7 @@ pub const AssetRegistry = struct {
             // .trails - now generated with data
             .particle_systems,
             .particle_spawners,
-            .entity_effects,
+            // .entity_effects - now generated with data
             .item_player_animations,
             .model_vfxs,
             .items,
@@ -713,10 +751,7 @@ pub const AssetRegistry = struct {
         };
 
         for (all_types) |asset_type| {
-            const payload = try packet.buildEmptyUpdatePacket(self.allocator, asset_type);
-
-            // Debug: print hex dump for specific troublesome packets
-            debugHexDump(asset_type, payload);
+            const payload = try asset_packets.buildEmptyPacket(self.allocator, asset_type.getPacketId());
 
             try packets.append(self.allocator, .{
                 .packet_id = asset_type.getPacketId(),
