@@ -369,10 +369,10 @@ test "parse Connect packet" {
     // uuid at offset 30-45
     @memset(data[30..46], 0xAB);
 
-    // Offset table at 46-65
-    std.mem.writeInt(i32, data[46..50], -1, .little); // language offset
+    // Offset table at 46-65 (order: username, identityToken, language, referralData, referralSource)
+    std.mem.writeInt(i32, data[46..50], 0, .little); // username offset (relative to var block)
     std.mem.writeInt(i32, data[50..54], -1, .little); // identity token offset
-    std.mem.writeInt(i32, data[54..58], 0, .little); // username offset (relative to var block)
+    std.mem.writeInt(i32, data[54..58], -1, .little); // language offset
     std.mem.writeInt(i32, data[58..62], -1, .little); // referral data offset
     std.mem.writeInt(i32, data[62..66], -1, .little); // referral source offset
 

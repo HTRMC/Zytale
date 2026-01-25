@@ -49,25 +49,29 @@ pub fn writeVarString(allocator: std.mem.Allocator, writer: *std.ArrayListUnmana
     try writer.appendSlice(allocator, str);
 }
 
-/// Serialize an empty Update* packet (no assets)
-/// This is used when we have no assets of a particular type
+/// Serialize an empty Update* packet (no assets, but with empty dictionary)
+/// The client expects a dictionary to always be present, even if empty
 pub fn serializeEmptyUpdate(
     allocator: std.mem.Allocator,
     update_type: UpdateType,
     max_id: i32,
     extra_fixed_bytes: []const u8,
 ) ![]u8 {
-    // Size: nullBits(1) + type(1) + maxId(4) + extra + no entries
-    const total_size = 6 + extra_fixed_bytes.len;
+    // Size: nullBits(1) + type(1) + maxId(4) + extra + VarInt(0) for empty dict
+    const total_size = 7 + extra_fixed_bytes.len;
     const buf = try allocator.alloc(u8, total_size);
 
-    buf[0] = 0x00; // nullBits: no optional fields (no entries)
+    buf[0] = 0x01; // nullBits: dictionary IS present (bit 0 = 1)
     buf[1] = @intFromEnum(update_type);
     std.mem.writeInt(i32, buf[2..6], max_id, .little);
 
+    var offset: usize = 6;
     if (extra_fixed_bytes.len > 0) {
-        @memcpy(buf[6..], extra_fixed_bytes);
+        @memcpy(buf[6..][0..extra_fixed_bytes.len], extra_fixed_bytes);
+        offset += extra_fixed_bytes.len;
     }
+
+    buf[offset] = 0x00; // VarInt count = 0 (empty dictionary)
 
     return buf;
 }
@@ -90,9 +94,8 @@ pub fn AssetSerializer(comptime EntryType: type) type {
             var data: std.ArrayListUnmanaged(u8) = .empty;
             errdefer data.deinit(allocator);
 
-            // nullBits
-            const null_bits: u8 = if (entries.len > 0) 0x01 else 0x00;
-            try data.append(allocator, null_bits);
+            // nullBits - ALWAYS indicate dictionary is present (even if empty)
+            try data.append(allocator, 0x01);
 
             // UpdateType
             try data.append(allocator, @intFromEnum(update_type));
@@ -107,21 +110,18 @@ pub fn AssetSerializer(comptime EntryType: type) type {
                 try data.appendSlice(allocator, extra_fixed_bytes);
             }
 
-            // Entries (if present)
-            if (entries.len > 0) {
-                // VarInt count
-                var count_buf: [5]u8 = undefined;
-                const count_len = writeVarInt(&count_buf, @intCast(entries.len));
-                try data.appendSlice(allocator, count_buf[0..count_len]);
+            // ALWAYS write VarInt count (even if 0)
+            var count_buf: [5]u8 = undefined;
+            const count_len = writeVarInt(&count_buf, @intCast(entries.len));
+            try data.appendSlice(allocator, count_buf[0..count_len]);
 
-                // Each entry: index (i32 LE) + serialized data
-                for (entries) |entry| {
-                    var index_buf: [4]u8 = undefined;
-                    std.mem.writeInt(i32, &index_buf, @intCast(entry.index), .little);
-                    try data.appendSlice(allocator, &index_buf);
+            // Each entry: index (i32 LE) + serialized data
+            for (entries) |entry| {
+                var index_buf: [4]u8 = undefined;
+                std.mem.writeInt(i32, &index_buf, @intCast(entry.index), .little);
+                try data.appendSlice(allocator, &index_buf);
 
-                    try serializeEntry(allocator, &entry.value, &data);
-                }
+                try serializeEntry(allocator, &entry.value, &data);
             }
 
             return data.toOwnedSlice(allocator);
@@ -132,6 +132,65 @@ pub fn AssetSerializer(comptime EntryType: type) type {
             value: EntryType,
         };
     };
+}
+
+/// String-keyed asset serializer (no maxId, string keys)
+/// Used by: UpdateTrails
+/// Format: nullBits(1) + type(1) + [VarInt count + (VarString key + serialized asset)*]
+pub fn StringKeyedSerializer(comptime EntryType: type) type {
+    return struct {
+        pub const SerializeFn = *const fn (allocator: std.mem.Allocator, entry: *const EntryType, writer: *std.ArrayListUnmanaged(u8)) anyerror!void;
+
+        pub const StringKeyedEntry = struct {
+            key: []const u8,
+            value: EntryType,
+        };
+
+        /// Serialize a map of assets with string keys to Update* packet format
+        pub fn serialize(
+            allocator: std.mem.Allocator,
+            update_type: UpdateType,
+            entries: []const StringKeyedEntry,
+            serializeEntry: SerializeFn,
+        ) ![]u8 {
+            var data: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer data.deinit(allocator);
+
+            // nullBits - ALWAYS indicate dictionary is present (even if empty)
+            try data.append(allocator, 0x01);
+
+            // UpdateType
+            try data.append(allocator, @intFromEnum(update_type));
+
+            // NO maxId for string-keyed packets!
+
+            // ALWAYS write VarInt count (even if 0)
+            var count_buf: [5]u8 = undefined;
+            const count_len = writeVarInt(&count_buf, @intCast(entries.len));
+            try data.appendSlice(allocator, count_buf[0..count_len]);
+
+            // Each entry: VarString key + serialized data
+            for (entries) |entry| {
+                try writeVarString(allocator, &data, entry.key);
+                try serializeEntry(allocator, &entry.value, &data);
+            }
+
+            return data.toOwnedSlice(allocator);
+        }
+    };
+}
+
+/// Serialize empty string-keyed Update packet (3 bytes)
+/// Includes empty dictionary (VarInt 0) instead of null dictionary
+pub fn serializeEmptyStringKeyedUpdate(
+    allocator: std.mem.Allocator,
+    update_type: UpdateType,
+) ![]u8 {
+    const buf = try allocator.alloc(u8, 3);
+    buf[0] = 0x01; // nullBits: dictionary IS present
+    buf[1] = @intFromEnum(update_type);
+    buf[2] = 0x00; // VarInt count = 0 (empty dictionary)
+    return buf;
 }
 
 /// Simple asset with just an ID string
@@ -349,18 +408,27 @@ fn serializeTagPatternRecursive(allocator: std.mem.Allocator, entry: *const TagP
 /// renderMode(1) + intersectionHighlight(8) + smooth(1) + frameSize(8) + frameRange(8) +
 /// frameLifeSpan(4) + idOffset(4) + textureOffset(4) + [variable]
 /// FIXED_BLOCK_SIZE = 61, VARIABLE_BLOCK_START = 69
+///
+/// Java nullBits mapping (correct):
+/// - bit 0 (0x01) = start (Edge) present
+/// - bit 1 (0x02) = end (Edge) present
+/// - bit 2 (0x04) = intersectionHighlight present
+/// - bit 3 (0x08) = frameSize present
+/// - bit 4 (0x10) = frameRange present
+/// - bit 5 (0x20) = id present
+/// - bit 6 (0x40) = texture present
 pub fn serializeTrail(allocator: std.mem.Allocator, entry: *const TrailAssetType, writer: *std.ArrayListUnmanaged(u8)) !void {
     const entry_start = writer.items.len;
 
-    // nullBits
+    // nullBits - MUST match Java bit mapping!
     var null_bits: u8 = 0;
-    if (entry.id.len > 0) null_bits |= 0x01;
-    if (entry.texture.len > 0) null_bits |= 0x02;
-    if (entry.start != null) null_bits |= 0x04;
-    if (entry.end != null) null_bits |= 0x08;
-    // bit 4 = intersectionHighlight (not implemented, always 0)
-    // bit 5 = frameSize (not implemented, always 0)
-    // bit 6 = frameRange (not implemented, always 0)
+    if (entry.start != null) null_bits |= 0x01; // bit 0
+    if (entry.end != null) null_bits |= 0x02; // bit 1
+    // bit 2 = intersectionHighlight (not implemented)
+    // bit 3 = frameSize (not implemented)
+    // bit 4 = frameRange (not implemented)
+    if (entry.id.len > 0) null_bits |= 0x20; // bit 5
+    if (entry.texture.len > 0) null_bits |= 0x40; // bit 6
     try writer.append(allocator, null_bits);
 
     // lifeSpan (i32)
@@ -467,7 +535,18 @@ pub fn buildEmptyUpdatePacket(
     allocator: std.mem.Allocator,
     asset_type: common.AssetType,
 ) ![]u8 {
-    // Different packets have different fixed block sizes
+    // String-keyed packets use 2-byte header (no maxId)
+    // Only UpdateTrails uses this format
+    const is_string_keyed = switch (asset_type) {
+        .trails => true,
+        else => false,
+    };
+
+    if (is_string_keyed) {
+        return serializeEmptyStringKeyedUpdate(allocator, .init);
+    }
+
+    // Integer-keyed packets use 6-byte header (with maxId)
     const extra_bytes: []const u8 = switch (asset_type) {
         .environments => &[_]u8{0}, // rebuildMapGeometry (bool)
         else => &[_]u8{},
@@ -482,10 +561,11 @@ test "empty update packet" {
     const pkt = try serializeEmptyUpdate(allocator, .init, 0, &[_]u8{});
     defer allocator.free(pkt);
 
-    try std.testing.expectEqual(@as(usize, 6), pkt.len);
-    try std.testing.expectEqual(@as(u8, 0x00), pkt[0]); // nullBits
+    try std.testing.expectEqual(@as(usize, 7), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits: dictionary present
     try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // UpdateType.init
     try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[2..6], .little)); // maxId
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[6]); // VarInt count = 0 (empty dictionary)
 }
 
 test "audio category serialization" {
@@ -514,4 +594,49 @@ test "audio category serialization" {
 
     // Should have 2 entries encoded after the header
     try std.testing.expect(pkt.len > 6);
+}
+
+test "AssetSerializer with zero entries produces valid empty dictionary" {
+    const allocator = std.testing.allocator;
+
+    const S = AssetSerializer(AudioCategoryAsset);
+    const entries = [_]S.IndexedEntry{};
+
+    const pkt = try S.serialize(
+        allocator,
+        .init,
+        0,
+        &entries,
+        &[_]u8{},
+        serializeAudioCategory,
+    );
+    defer allocator.free(pkt);
+
+    // Must be 7 bytes: nullBits(1) + type(1) + maxId(4) + VarInt count 0(1)
+    try std.testing.expectEqual(@as(usize, 7), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits: dictionary IS present
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // UpdateType.init
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[2..6], .little)); // maxId
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[6]); // VarInt count = 0 (empty dictionary)
+}
+
+test "StringKeyedSerializer with zero entries produces valid empty dictionary" {
+    const allocator = std.testing.allocator;
+
+    const S = StringKeyedSerializer(TrailAssetType);
+    const entries = [_]S.StringKeyedEntry{};
+
+    const pkt = try S.serialize(
+        allocator,
+        .init,
+        &entries,
+        serializeTrail,
+    );
+    defer allocator.free(pkt);
+
+    // Must be 3 bytes: nullBits(1) + type(1) + VarInt count 0(1)
+    try std.testing.expectEqual(@as(usize, 3), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits: dictionary IS present
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // UpdateType.init
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[2]); // VarInt count = 0 (empty dictionary)
 }
