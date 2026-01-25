@@ -529,33 +529,85 @@ fn writeI32(allocator: std.mem.Allocator, writer: *std.ArrayListUnmanaged(u8), v
     try writer.appendSlice(allocator, &buf);
 }
 
-/// Build an empty Update* packet with proper format
+/// Build an empty Update* packet with proper format for each asset type
+/// Different asset types have different header structures based on FIXED_BLOCK_SIZE
 /// Used as placeholder when we don't have asset data yet
 pub fn buildEmptyUpdatePacket(
     allocator: std.mem.Allocator,
     asset_type: common.AssetType,
 ) ![]u8 {
-    // String-keyed packets use 2-byte header (no maxId)
-    // Only UpdateTrails uses this format
-    const is_string_keyed = switch (asset_type) {
-        .trails => true,
-        else => false,
+    return switch (asset_type) {
+        // String-keyed: 3 bytes (nullBits + type + VarInt 0)
+        .trails => serializeEmptyStringKeyedUpdate(allocator, .init),
+
+        // FIXED=10: nullBits + type + maxId + 4 booleans + VarInt 0
+        .block_types => serializeEmptyUpdate(allocator, .init, 0, &[_]u8{ 0, 0, 0, 0 }),
+
+        // FIXED=7: nullBits + type + maxId + 1 boolean + VarInt 0
+        .environments => serializeEmptyUpdate(allocator, .init, 0, &[_]u8{0}),
+
+        // FIXED=6: nullBits + type + maxId + VarInt 0 (integer-keyed with maxId)
+        .block_hitboxes,
+        .block_sound_sets,
+        .item_sound_sets,
+        .weathers,
+        => serializeEmptyUpdate(allocator, .init, 0, &[_]u8{}),
+
+        // FIXED=4: nullBits + type + 2 booleans + offset table + VarInt counts
+        .items => blk: {
+            // Items has 2 booleans + offset table for 2 variable fields
+            const buf = try allocator.alloc(u8, 14);
+            buf[0] = 0x03; // nullBits: both fields present (items and removedItems)
+            buf[1] = 0x00; // type = Init
+            buf[2] = 0; // updateModels = false
+            buf[3] = 0; // updateIcons = false
+            // Offset to items (at variable block start = offset 0)
+            std.mem.writeInt(i32, buf[4..8], 0, .little);
+            // Offset to removedItems (after items VarInt 0 = offset 1)
+            std.mem.writeInt(i32, buf[8..12], 1, .little);
+            buf[12] = 0x00; // items count = 0
+            buf[13] = 0x00; // removedItems count = 0
+            break :blk buf;
+        },
+
+        // FIXED=4: nullBits + type + 2 booleans + offset table + VarInt counts
+        .item_player_animations => blk: {
+            const buf = try allocator.alloc(u8, 14);
+            buf[0] = 0x03; // nullBits: both fields present
+            buf[1] = 0x00; // type = Init
+            buf[2] = 0; // bool1
+            buf[3] = 0; // bool2
+            std.mem.writeInt(i32, buf[4..8], 0, .little);
+            std.mem.writeInt(i32, buf[8..12], 1, .little);
+            buf[12] = 0x00;
+            buf[13] = 0x00;
+            break :blk buf;
+        },
+
+        // FIXED=2 with 2 variable fields (need offset table)
+        .particle_systems, .particle_spawners, .recipes => blk: {
+            const buf = try allocator.alloc(u8, 12); // 1+1+8+2
+            buf[0] = 0x03; // nullBits: both fields present
+            buf[1] = 0x00; // type = Init
+            std.mem.writeInt(i32, buf[2..6], 0, .little); // offset to field 0
+            std.mem.writeInt(i32, buf[6..10], 1, .little); // offset to field 1
+            buf[10] = 0x00; // field 0 count = 0
+            buf[11] = 0x00; // field 1 count = 0
+            break :blk buf;
+        },
+
+        // FIXED=2: Most packets - just nullBits + type + VarInt 0 (NO maxId!)
+        else => blk: {
+            const buf = try allocator.alloc(u8, 3);
+            buf[0] = 0x01; // nullBits: dictionary present
+            buf[1] = 0x00; // type = Init
+            buf[2] = 0x00; // VarInt count = 0
+            break :blk buf;
+        },
     };
-
-    if (is_string_keyed) {
-        return serializeEmptyStringKeyedUpdate(allocator, .init);
-    }
-
-    // Integer-keyed packets use 6-byte header (with maxId)
-    const extra_bytes: []const u8 = switch (asset_type) {
-        .environments => &[_]u8{0}, // rebuildMapGeometry (bool)
-        else => &[_]u8{},
-    };
-
-    return serializeEmptyUpdate(allocator, .init, 0, extra_bytes);
 }
 
-test "empty update packet" {
+test "empty update packet - basic" {
     const allocator = std.testing.allocator;
 
     const pkt = try serializeEmptyUpdate(allocator, .init, 0, &[_]u8{});
@@ -566,6 +618,120 @@ test "empty update packet" {
     try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // UpdateType.init
     try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[2..6], .little)); // maxId
     try std.testing.expectEqual(@as(u8, 0x00), pkt[6]); // VarInt count = 0 (empty dictionary)
+}
+
+test "buildEmptyUpdatePacket - FIXED=2 packets have no maxId" {
+    const allocator = std.testing.allocator;
+
+    // Most packets have FIXED_BLOCK_SIZE=2, meaning no maxId field
+    const pkt = try buildEmptyUpdatePacket(allocator, .audio_categories);
+    defer allocator.free(pkt);
+
+    // Should be 3 bytes: nullBits(1) + type(1) + VarInt 0(1)
+    try std.testing.expectEqual(@as(usize, 3), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits: dictionary present
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // UpdateType.init
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[2]); // VarInt count = 0
+}
+
+test "buildEmptyUpdatePacket - block_types has maxId + 4 booleans" {
+    const allocator = std.testing.allocator;
+
+    const pkt = try buildEmptyUpdatePacket(allocator, .block_types);
+    defer allocator.free(pkt);
+
+    // FIXED=10: nullBits(1) + type(1) + maxId(4) + 4 booleans(4) + VarInt 0(1) = 11 bytes
+    try std.testing.expectEqual(@as(usize, 11), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type = Init
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[2..6], .little)); // maxId = 0
+    try std.testing.expectEqual(@as(u8, 0), pkt[6]); // bool 1
+    try std.testing.expectEqual(@as(u8, 0), pkt[7]); // bool 2
+    try std.testing.expectEqual(@as(u8, 0), pkt[8]); // bool 3
+    try std.testing.expectEqual(@as(u8, 0), pkt[9]); // bool 4
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[10]); // VarInt count = 0
+}
+
+test "buildEmptyUpdatePacket - environments has maxId + 1 boolean" {
+    const allocator = std.testing.allocator;
+
+    const pkt = try buildEmptyUpdatePacket(allocator, .environments);
+    defer allocator.free(pkt);
+
+    // FIXED=7: nullBits(1) + type(1) + maxId(4) + 1 boolean(1) + VarInt 0(1) = 8 bytes
+    try std.testing.expectEqual(@as(usize, 8), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[2..6], .little)); // maxId
+    try std.testing.expectEqual(@as(u8, 0), pkt[6]); // rebuildMapGeometry = false
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[7]); // VarInt count = 0
+}
+
+test "buildEmptyUpdatePacket - block_sound_sets has maxId (FIXED=6)" {
+    const allocator = std.testing.allocator;
+
+    const pkt = try buildEmptyUpdatePacket(allocator, .block_sound_sets);
+    defer allocator.free(pkt);
+
+    // FIXED=6: nullBits(1) + type(1) + maxId(4) + VarInt 0(1) = 7 bytes
+    try std.testing.expectEqual(@as(usize, 7), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[2..6], .little)); // maxId
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[6]); // VarInt count = 0
+}
+
+test "buildEmptyUpdatePacket - item_sound_sets has maxId (FIXED=6)" {
+    const allocator = std.testing.allocator;
+
+    const pkt = try buildEmptyUpdatePacket(allocator, .item_sound_sets);
+    defer allocator.free(pkt);
+
+    // FIXED=6: nullBits(1) + type(1) + maxId(4) + VarInt 0(1) = 7 bytes
+    try std.testing.expectEqual(@as(usize, 7), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[2..6], .little)); // maxId
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[6]); // VarInt count = 0
+}
+
+test "buildEmptyUpdatePacket - weathers has maxId (FIXED=6)" {
+    const allocator = std.testing.allocator;
+
+    const pkt = try buildEmptyUpdatePacket(allocator, .weathers);
+    defer allocator.free(pkt);
+
+    // FIXED=6: nullBits(1) + type(1) + maxId(4) + VarInt 0(1) = 7 bytes
+    try std.testing.expectEqual(@as(usize, 7), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[2..6], .little)); // maxId
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[6]); // VarInt count = 0
+}
+
+test "buildEmptyUpdatePacket - trails is string-keyed (no maxId)" {
+    const allocator = std.testing.allocator;
+
+    const pkt = try buildEmptyUpdatePacket(allocator, .trails);
+    defer allocator.free(pkt);
+
+    // String-keyed: nullBits(1) + type(1) + VarInt 0(1) = 3 bytes
+    try std.testing.expectEqual(@as(usize, 3), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[2]); // VarInt count = 0
+}
+
+test "buildEmptyUpdatePacket - items has offset table" {
+    const allocator = std.testing.allocator;
+
+    const pkt = try buildEmptyUpdatePacket(allocator, .items);
+    defer allocator.free(pkt);
+
+    // FIXED=4: nullBits(1) + type(1) + 2 bools(2) + 2 offsets(8) + 2 VarInts(2) = 14 bytes
+    try std.testing.expectEqual(@as(usize, 14), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x03), pkt[0]); // nullBits: both fields present
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type = Init
 }
 
 test "audio category serialization" {
