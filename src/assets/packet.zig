@@ -551,6 +551,7 @@ pub fn buildEmptyUpdatePacket(
         .block_sound_sets,
         .item_sound_sets,
         .weathers,
+        .entity_effects,
         => serializeEmptyUpdate(allocator, .init, 0, &[_]u8{}),
 
         // FIXED=4: nullBits + type + 2 booleans + offset table + VarInt counts
@@ -699,6 +700,20 @@ test "buildEmptyUpdatePacket - weathers has maxId (FIXED=6)" {
     const allocator = std.testing.allocator;
 
     const pkt = try buildEmptyUpdatePacket(allocator, .weathers);
+    defer allocator.free(pkt);
+
+    // FIXED=6: nullBits(1) + type(1) + maxId(4) + VarInt 0(1) = 7 bytes
+    try std.testing.expectEqual(@as(usize, 7), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[2..6], .little)); // maxId
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[6]); // VarInt count = 0
+}
+
+test "buildEmptyUpdatePacket - entity_effects has maxId (FIXED=6)" {
+    const allocator = std.testing.allocator;
+
+    const pkt = try buildEmptyUpdatePacket(allocator, .entity_effects);
     defer allocator.free(pkt);
 
     // FIXED=6: nullBits(1) + type(1) + maxId(4) + VarInt 0(1) = 7 bytes
