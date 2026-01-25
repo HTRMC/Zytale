@@ -644,6 +644,27 @@ pub const AssetRegistry = struct {
 
     /// Generate empty packets for all required asset types not yet implemented
     fn generateEmptyPackets(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
+        // Debug: Helper to print hex dump for specific asset types
+        const debugHexDump = struct {
+            fn dump(asset_type: AssetType, payload: []const u8) void {
+                // Only dump for debugging specific packets
+                if (asset_type == .entity_effects or
+                    asset_type == .block_sound_sets or
+                    asset_type == .item_player_animations)
+                {
+                    std.debug.print("DEBUG {s} (ID {d}, {d} bytes): ", .{
+                        @tagName(asset_type),
+                        asset_type.getPacketId(),
+                        payload.len,
+                    });
+                    for (payload) |b| {
+                        std.debug.print("{x:0>2} ", .{b});
+                    }
+                    std.debug.print("\n", .{});
+                }
+            }
+        }.dump;
+
         // Asset types that still need empty packets (not implemented yet)
         const all_types = [_]AssetType{
             .block_types,
@@ -693,6 +714,10 @@ pub const AssetRegistry = struct {
 
         for (all_types) |asset_type| {
             const payload = try packet.buildEmptyUpdatePacket(self.allocator, asset_type);
+
+            // Debug: print hex dump for specific troublesome packets
+            debugHexDump(asset_type, payload);
+
             try packets.append(self.allocator, .{
                 .packet_id = asset_type.getPacketId(),
                 .payload = payload,

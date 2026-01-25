@@ -193,6 +193,22 @@ pub fn serializeEmptyStringKeyedUpdate(
     return buf;
 }
 
+/// Serialize empty Update* packet with NULL dictionary (nullBits=0)
+/// Some clients may expect null instead of empty dictionary
+/// Format: nullBits(1) + type(1) + maxId(4) = 6 bytes (NO VarInt count!)
+pub fn serializeNullDictionaryUpdate(
+    allocator: std.mem.Allocator,
+    update_type: UpdateType,
+    max_id: i32,
+) ![]u8 {
+    const buf = try allocator.alloc(u8, 6);
+    buf[0] = 0x00; // nullBits: dictionary is NULL (not present)
+    buf[1] = @intFromEnum(update_type);
+    std.mem.writeInt(i32, buf[2..6], max_id, .little);
+    // NO VarInt count when dictionary is null
+    return buf;
+}
+
 /// Simple asset with just an ID string
 /// Used for: AudioCategories (with volume), TagPatterns, etc.
 pub const SimpleStringAsset = struct {
@@ -571,19 +587,10 @@ pub fn buildEmptyUpdatePacket(
             break :blk buf;
         },
 
-        // FIXED=4: nullBits + type + 2 booleans + offset table + VarInt counts
-        .item_player_animations => blk: {
-            const buf = try allocator.alloc(u8, 14);
-            buf[0] = 0x03; // nullBits: both fields present
-            buf[1] = 0x00; // type = Init
-            buf[2] = 0; // bool1
-            buf[3] = 0; // bool2
-            std.mem.writeInt(i32, buf[4..8], 0, .little);
-            std.mem.writeInt(i32, buf[8..12], 1, .little);
-            buf[12] = 0x00;
-            buf[13] = 0x00;
-            break :blk buf;
-        },
+        // FIXED=2: String-keyed dictionary (Map<String, ItemPlayerAnimations>)
+        // Java: FIXED_BLOCK_SIZE = 2, no maxId, no booleans, no offset table
+        // Format: nullBits(1) + type(1) + VarInt 0(1) = 3 bytes
+        .item_player_animations => serializeEmptyStringKeyedUpdate(allocator, .init),
 
         // FIXED=2 with 2 variable fields (need offset table)
         .particle_systems, .particle_spawners, .recipes => blk: {
@@ -734,6 +741,20 @@ test "buildEmptyUpdatePacket - trails is string-keyed (no maxId)" {
     try std.testing.expectEqual(@as(usize, 3), pkt.len);
     try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits
     try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[2]); // VarInt count = 0
+}
+
+test "buildEmptyUpdatePacket - item_player_animations is string-keyed (FIXED=2)" {
+    const allocator = std.testing.allocator;
+
+    const pkt = try buildEmptyUpdatePacket(allocator, .item_player_animations);
+    defer allocator.free(pkt);
+
+    // Java: FIXED_BLOCK_SIZE = 2, String-keyed Map<String, ItemPlayerAnimations>
+    // Format: nullBits(1) + type(1) + VarInt 0(1) = 3 bytes (no maxId!)
+    try std.testing.expectEqual(@as(usize, 3), pkt.len);
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits: dictionary present
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type = Init
     try std.testing.expectEqual(@as(u8, 0x00), pkt[2]); // VarInt count = 0
 }
 
