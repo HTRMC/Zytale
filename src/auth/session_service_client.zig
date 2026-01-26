@@ -429,13 +429,11 @@ pub const SessionServiceClient = struct {
         // Check status code
         if (result.status == .unauthorized or result.status == .forbidden) {
             log.err("Authentication failed: {}", .{result.status});
-            response_writer.deinit();
             return SessionServiceError.AuthenticationFailed;
         }
 
         if (result.status != .ok) {
             log.err("Request failed with status: {}", .{result.status});
-            response_writer.deinit();
             return SessionServiceError.ServiceError;
         }
 
