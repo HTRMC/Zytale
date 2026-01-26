@@ -135,7 +135,75 @@ pub const ReverbEffectAsset = struct {
     pub fn deinit(self: *Self, allocator: Allocator) void {
         allocator.free(self.id);
     }
+
+    /// Protocol serialization constants
+    pub const NULLABLE_BIT_FIELD_SIZE: u32 = 1;
+    pub const FIXED_BLOCK_SIZE: u32 = 54;
+    pub const VARIABLE_FIELD_COUNT: u32 = 1;
+    pub const VARIABLE_BLOCK_START: u32 = 54;
+
+    /// Serialize to protocol format
+    /// Format: nullBits(1) + 13 floats(52) + bool(1) + if bit 0: VarString id
+    pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
+        var buf = std.ArrayListUnmanaged(u8){};
+        errdefer buf.deinit(allocator);
+
+        // nullBits
+        var null_bits: u8 = 0;
+        if (self.id.len > 0) null_bits |= 0x01;
+        try buf.append(allocator, null_bits);
+
+        // 13 float parameters (52 bytes)
+        try writeF32(&buf, allocator, self.dry_gain);
+        try writeF32(&buf, allocator, self.modal_density);
+        try writeF32(&buf, allocator, self.diffusion);
+        try writeF32(&buf, allocator, self.gain);
+        try writeF32(&buf, allocator, self.high_frequency_gain);
+        try writeF32(&buf, allocator, self.decay_time);
+        try writeF32(&buf, allocator, self.high_frequency_decay_ratio);
+        try writeF32(&buf, allocator, self.reflection_gain);
+        try writeF32(&buf, allocator, self.reflection_delay);
+        try writeF32(&buf, allocator, self.late_reverb_gain);
+        try writeF32(&buf, allocator, self.late_reverb_delay);
+        try writeF32(&buf, allocator, self.room_rolloff_factor);
+        try writeF32(&buf, allocator, self.air_absorption_hf_gain);
+
+        // limitDecayHighFrequency (1 byte bool)
+        try buf.append(allocator, if (self.limit_decay_high_frequency) @as(u8, 1) else 0);
+
+        // id string (if present)
+        if (self.id.len > 0) {
+            try writeVarString(&buf, allocator, self.id);
+        }
+
+        return buf.toOwnedSlice(allocator);
+    }
 };
+
+fn writeF32(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, value: f32) !void {
+    var bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &bytes, @bitCast(value), .little);
+    try buf.appendSlice(allocator, &bytes);
+}
+
+fn writeVarString(buf: *std.ArrayListUnmanaged(u8), allocator: Allocator, str: []const u8) !void {
+    var vi_buf: [5]u8 = undefined;
+    const vi_len = writeVarIntBuf(&vi_buf, @intCast(str.len));
+    try buf.appendSlice(allocator, vi_buf[0..vi_len]);
+    try buf.appendSlice(allocator, str);
+}
+
+fn writeVarIntBuf(buf: *[5]u8, value: i32) usize {
+    var v: u32 = @bitCast(value);
+    var i: usize = 0;
+    while (v >= 0x80) {
+        buf[i] = @truncate((v & 0x7F) | 0x80);
+        v >>= 7;
+        i += 1;
+    }
+    buf[i] = @truncate(v);
+    return i + 1;
+}
 
 test "ReverbEffectAsset defaults" {
     const allocator = std.testing.allocator;
