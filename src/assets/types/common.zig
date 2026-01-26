@@ -239,3 +239,29 @@ test "Color from hex" {
     try std.testing.expectEqual(@as(u8, 0), red.g);
     try std.testing.expectEqual(@as(u8, 0), red.b);
 }
+
+/// Vector2f type (8 bytes)
+pub const Vector2f = struct {
+    x: f32,
+    y: f32,
+
+    pub const ZERO: Vector2f = .{ .x = 0.0, .y = 0.0 };
+    pub const ONE: Vector2f = .{ .x = 1.0, .y = 1.0 };
+
+    /// Serialize to buffer (8 bytes, little endian)
+    pub fn serialize(self: Vector2f, buf: []u8) void {
+        std.mem.writeInt(u32, buf[0..4], @bitCast(self.x), .little);
+        std.mem.writeInt(u32, buf[4..8], @bitCast(self.y), .little);
+    }
+};
+
+test "Vector2f serialization" {
+    var buf: [8]u8 = undefined;
+    const v = Vector2f{ .x = 1.0, .y = 2.0 };
+    v.serialize(&buf);
+
+    const x: f32 = @bitCast(std.mem.readInt(u32, buf[0..4], .little));
+    const y: f32 = @bitCast(std.mem.readInt(u32, buf[4..8], .little));
+    try std.testing.expectEqual(@as(f32, 1.0), x);
+    try std.testing.expectEqual(@as(f32, 2.0), y);
+}
