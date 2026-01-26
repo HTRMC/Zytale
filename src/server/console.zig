@@ -184,13 +184,17 @@ pub const Console = struct {
         std.debug.print("\n", .{});
         std.debug.print("=== Zytale Server Commands ===\n", .{});
         std.debug.print("\n", .{});
-        std.debug.print("  /help                    Show this help message\n", .{});
-        std.debug.print("  /status                  Show server status\n", .{});
-        std.debug.print("  /auth status             Show authentication status\n", .{});
-        std.debug.print("  /auth login device       Start OAuth device flow login\n", .{});
-        std.debug.print("  /auth logout             Clear stored credentials\n", .{});
-        std.debug.print("  /auth refresh            Refresh expired tokens\n", .{});
-        std.debug.print("  /quit                    Stop the server\n", .{});
+        std.debug.print("  /help                        Show this help message\n", .{});
+        std.debug.print("  /status                      Show server status\n", .{});
+        std.debug.print("  /auth status                 Show authentication status\n", .{});
+        std.debug.print("  /auth login device           Start OAuth device flow login\n", .{});
+        std.debug.print("  /auth logout                 Clear stored credentials\n", .{});
+        std.debug.print("  /auth refresh                Refresh expired tokens\n", .{});
+        std.debug.print("  /auth select <username>      Select a profile by username\n", .{});
+        std.debug.print("  /auth profiles               List available game profiles\n", .{});
+        std.debug.print("  /auth persistence            Show current storage type\n", .{});
+        std.debug.print("  /auth persistence <type>     Switch storage (memory|encrypted)\n", .{});
+        std.debug.print("  /quit                        Stop the server\n", .{});
         std.debug.print("\n", .{});
     }
 
@@ -198,7 +202,7 @@ pub const Console = struct {
     fn cmdAuth(self: *Self, args: []const u8) void {
         var iter = std.mem.splitScalar(u8, args, ' ');
         const subcmd = iter.next() orelse {
-            std.debug.print("Usage: /auth <status|login|logout|refresh>\n", .{});
+            std.debug.print("Usage: /auth <status|login|logout|refresh|select|profiles|persistence>\n", .{});
             return;
         };
 
@@ -216,9 +220,20 @@ pub const Console = struct {
             self.cmdAuthLogout();
         } else if (std.mem.eql(u8, subcmd, "refresh")) {
             self.cmdAuthRefresh();
+        } else if (std.mem.eql(u8, subcmd, "select")) {
+            const username = iter.next() orelse {
+                std.debug.print("Usage: /auth select <username>\n", .{});
+                return;
+            };
+            self.cmdAuthSelect(username);
+        } else if (std.mem.eql(u8, subcmd, "profiles")) {
+            self.cmdAuthProfiles();
+        } else if (std.mem.eql(u8, subcmd, "persistence")) {
+            const storage_type = iter.next();
+            self.cmdAuthPersistence(storage_type);
         } else {
             std.debug.print("Unknown auth command: {s}\n", .{subcmd});
-            std.debug.print("Usage: /auth <status|login|logout|refresh>\n", .{});
+            std.debug.print("Usage: /auth <status|login|logout|refresh|select|profiles|persistence>\n", .{});
         }
     }
 
@@ -226,6 +241,19 @@ pub const Console = struct {
     fn cmdAuthStatus(self: *Self) void {
         std.debug.print("\n", .{});
         std.debug.print("=== Authentication Status ===\n", .{});
+        std.debug.print("  Mode: {s}\n", .{self.auth_manager.getAuthMode().toString()});
+        std.debug.print("  State: {s}\n", .{self.auth_manager.getAuthStatus()});
+        std.debug.print("  Storage: {s}\n", .{self.auth_manager.getStoreType().toString()});
+
+        const expiry = self.auth_manager.getSecondsUntilExpiry();
+        if (expiry > 0) {
+            const minutes = @divFloor(expiry, 60);
+            const seconds = @mod(expiry, 60);
+            std.debug.print("  Token expires in: {d}m {d}s\n", .{ minutes, seconds });
+        } else if (self.auth_manager.isAuthenticated()) {
+            std.debug.print("  Token expires in: EXPIRED\n", .{});
+        }
+
         self.credentials.logStatus();
         std.debug.print("\n", .{});
     }
@@ -331,6 +359,80 @@ pub const Console = struct {
         };
 
         std.debug.print("Tokens refreshed successfully.\n", .{});
+    }
+
+    /// /auth select <username> command
+    fn cmdAuthSelect(self: *Self, username: []const u8) void {
+        std.debug.print("Selecting profile: {s}...\n", .{username});
+
+        self.auth_manager.selectProfileByUsername(username) catch |err| {
+            std.debug.print("Failed to select profile: {}\n", .{err});
+            return;
+        };
+
+        std.debug.print("Profile selected successfully.\n", .{});
+        if (self.auth_manager.isAuthenticated()) {
+            std.debug.print("Logged in as: {s}\n", .{self.credentials.username orelse "unknown"});
+        }
+    }
+
+    /// /auth profiles command
+    fn cmdAuthProfiles(self: *Self) void {
+        if (self.credentials.access_token == null) {
+            std.debug.print("No access token available. Use /auth login device first.\n", .{});
+            return;
+        }
+
+        std.debug.print("Fetching profiles...\n", .{});
+
+        const profiles = self.auth_manager.listProfiles() catch |err| {
+            std.debug.print("Failed to fetch profiles: {}\n", .{err});
+            return;
+        };
+
+        std.debug.print("\n", .{});
+        std.debug.print("=== Available Profiles ===\n", .{});
+        for (profiles, 0..) |profile, i| {
+            std.debug.print("  [{d}] {s}\n", .{ i + 1, profile.username });
+        }
+        std.debug.print("\n", .{});
+        std.debug.print("Use /auth select <username> to switch profiles.\n", .{});
+    }
+
+    /// /auth persistence command
+    fn cmdAuthPersistence(self: *Self, storage_type: ?[]const u8) void {
+        if (storage_type) |type_str| {
+            // Set storage type
+            if (std.ascii.eqlIgnoreCase(type_str, "memory")) {
+                self.auth_manager.setStoreType(.memory) catch |err| {
+                    std.debug.print("Failed to switch to memory storage: {}\n", .{err});
+                    return;
+                };
+                std.debug.print("Switched to memory-only storage.\n", .{});
+                std.debug.print("WARNING: Credentials will NOT persist across restarts.\n", .{});
+            } else if (std.ascii.eqlIgnoreCase(type_str, "encrypted")) {
+                self.auth_manager.setStoreType(.encrypted) catch |err| {
+                    std.debug.print("Failed to switch to encrypted storage: {}\n", .{err});
+                    return;
+                };
+                std.debug.print("Switched to encrypted persistent storage.\n", .{});
+            } else {
+                std.debug.print("Unknown storage type: {s}\n", .{type_str});
+                std.debug.print("Available types: memory, encrypted\n", .{});
+            }
+        } else {
+            // Show current storage type
+            const current = self.auth_manager.getStoreType();
+            std.debug.print("\n", .{});
+            std.debug.print("=== Credential Storage ===\n", .{});
+            std.debug.print("  Current: {s}\n", .{current.toString()});
+            std.debug.print("\n", .{});
+            std.debug.print("Available storage types:\n", .{});
+            std.debug.print("  memory    - In-memory only (lost on restart)\n", .{});
+            std.debug.print("  encrypted - Encrypted file storage (persists)\n", .{});
+            std.debug.print("\n", .{});
+            std.debug.print("Use /auth persistence <type> to switch.\n", .{});
+        }
     }
 
     /// /status command

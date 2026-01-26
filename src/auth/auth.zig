@@ -5,6 +5,12 @@ const OAuthError = @import("oauth.zig").OAuthError;
 const TokenResponse = @import("oauth.zig").TokenResponse;
 const SessionService = @import("session.zig").SessionService;
 const GameSession = @import("session.zig").GameSession;
+const EncryptedCredentialStore = @import("encrypted_credential_store.zig").EncryptedCredentialStore;
+const EncryptedStoredCredentials = @import("encrypted_credential_store.zig").StoredCredentials;
+const MemoryCredentialStore = @import("memory_credential_store.zig").MemoryCredentialStore;
+
+/// Token refresh buffer in seconds (refresh 300 seconds before expiry, matching Java)
+const REFRESH_BUFFER_SECONDS: i64 = 300;
 
 /// Get current Unix timestamp using std.Io
 fn getTimestamp() i64 {
@@ -65,11 +71,66 @@ pub const GameSessionResponse = @import("session_service_client.zig").GameSessio
 pub const ServerCredentials = @import("server_credentials.zig").ServerCredentials;
 pub const CredentialSource = @import("server_credentials.zig").CredentialSource;
 pub const computeCertFingerprint = @import("server_credentials.zig").computeCertFingerprint;
-pub const CredentialStore = @import("credential_store.zig").CredentialStore;
-pub const StoredCredentials = @import("credential_store.zig").StoredCredentials;
 pub const DEFAULT_CLIENT_ID = @import("oauth.zig").DEFAULT_CLIENT_ID;
 
+// Re-export credential stores
+pub const encrypted_credential_store = @import("encrypted_credential_store.zig");
+pub const memory_credential_store = @import("memory_credential_store.zig");
+pub const machine_id = @import("machine_id.zig");
+
 const log = std.log.scoped(.auth);
+
+/// Authentication mode (matching Java ServerAuthManager.AuthMode)
+pub const AuthMode = enum {
+    /// Not authenticated
+    none,
+    /// Singleplayer mode with owner-provided tokens
+    singleplayer,
+    /// External session tokens (CLI/env vars)
+    external_session,
+    /// OAuth browser flow (not implemented in Zig)
+    oauth_browser,
+    /// OAuth device flow
+    oauth_device,
+    /// Restored from encrypted storage
+    oauth_store,
+
+    pub fn toString(self: AuthMode) []const u8 {
+        return switch (self) {
+            .none => "NONE",
+            .singleplayer => "SINGLEPLAYER",
+            .external_session => "EXTERNAL_SESSION",
+            .oauth_browser => "OAUTH_BROWSER",
+            .oauth_device => "OAUTH_DEVICE",
+            .oauth_store => "OAUTH_STORE",
+        };
+    }
+};
+
+/// Credential storage type (matching Java persistence options)
+pub const AuthCredentialStoreType = enum {
+    /// Memory-only storage (credentials lost on restart)
+    memory,
+    /// Encrypted file storage (persists across restarts)
+    encrypted,
+
+    pub fn toString(self: AuthCredentialStoreType) []const u8 {
+        return switch (self) {
+            .memory => "Memory",
+            .encrypted => "Encrypted",
+        };
+    }
+};
+
+/// Result of authentication attempt
+pub const AuthResult = enum {
+    /// Authentication successful
+    success,
+    /// Waiting for profile selection
+    pending_profile_selection,
+    /// Authentication failed
+    failed,
+};
 
 /// Authentication state machine
 pub const AuthState = enum {
@@ -106,8 +167,13 @@ pub const AuthManager = struct {
     oauth_client: OAuthClient,
     session_service: SessionService,
     session_service_client: SessionServiceClient,
-    credential_store: CredentialStore,
+    encrypted_store: EncryptedCredentialStore,
+    memory_store: ?MemoryCredentialStore,
+    store_type: AuthCredentialStoreType,
     state: AuthState,
+
+    /// Current authentication mode
+    auth_mode: AuthMode,
 
     /// Current server credentials
     credentials: *ServerCredentials,
@@ -126,6 +192,15 @@ pub const AuthManager = struct {
     /// Error message if authentication failed
     error_message: ?[]const u8,
 
+    /// Token expiration timestamp for refresh scheduling
+    token_expiry: i64,
+
+    /// Selected profile UUID (stored for session recreation)
+    selected_profile_uuid: ?[16]u8,
+
+    /// Available profiles (cached after fetch)
+    available_profiles: ?[]GameProfile,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, client_id: []const u8, credentials: *ServerCredentials) Self {
@@ -134,8 +209,11 @@ pub const AuthManager = struct {
             .oauth_client = OAuthClient.init(allocator, client_id, null),
             .session_service = SessionService.init(allocator),
             .session_service_client = SessionServiceClient.init(allocator),
-            .credential_store = CredentialStore.init(allocator),
+            .encrypted_store = EncryptedCredentialStore.init(allocator),
+            .memory_store = null,
+            .store_type = .encrypted,
             .state = .idle,
+            .auth_mode = .none,
             .credentials = credentials,
             .pending_profiles = null,
             .pending_access_token = null,
@@ -143,6 +221,9 @@ pub const AuthManager = struct {
             .pending_id_token = null,
             .server_cert_fingerprint = [_]u8{0} ** 32,
             .error_message = null,
+            .token_expiry = 0,
+            .selected_profile_uuid = null,
+            .available_profiles = null,
         };
     }
 
@@ -150,8 +231,14 @@ pub const AuthManager = struct {
         self.oauth_client.deinit();
         self.session_service.deinit();
         self.session_service_client.deinit();
-        self.credential_store.deinit();
+        self.encrypted_store.deinit();
+        if (self.memory_store) |*store| {
+            store.deinit();
+        }
         self.freePendingData();
+        if (self.available_profiles) |profiles| {
+            self.session_service_client.freeProfiles(profiles);
+        }
         if (self.error_message) |msg| {
             self.allocator.free(msg);
         }
@@ -346,27 +433,18 @@ pub const AuthManager = struct {
             game_session.expires_at,
         );
 
-        // Save to disk
-        try self.saveCredentials();
+        // Store profile UUID and expiry
+        self.selected_profile_uuid = profile.uuid;
+        self.token_expiry = game_session.expires_at;
+        self.auth_mode = .oauth_device;
+
+        // Save to encrypted storage
+        self.saveToEncryptedStore() catch |err| {
+            log.warn("Failed to save to encrypted store: {}", .{err});
+        };
 
         self.state = .authenticated;
         log.info("Authentication successful! Logged in as: {s}", .{profile.username});
-    }
-
-    /// Save current credentials to disk
-    pub fn saveCredentials(self: *Self) !void {
-        const creds = self.credentials;
-
-        const stored = StoredCredentials{
-            .session_token = creds.session_token,
-            .identity_token = creds.identity_token,
-            .access_token = creds.access_token,
-            .refresh_token = creds.refresh_token,
-            .username = creds.username,
-            .expires_at = creds.expires_at,
-        };
-
-        try self.credential_store.save(&stored);
     }
 
     /// Refresh expired tokens using refresh token
@@ -403,7 +481,7 @@ pub const AuthManager = struct {
         // This is needed because the session token may have expired too
         // For now, we'll just save the updated credentials
 
-        try self.saveCredentials();
+        try self.saveToEncryptedStore();
         log.info("Token refreshed successfully", .{});
     }
 
@@ -411,12 +489,23 @@ pub const AuthManager = struct {
     pub fn logout(self: *Self) void {
         log.info("Logging out...", .{});
 
-        // Clear disk storage
-        self.credential_store.clear();
+        // Clear both stores
+        self.encrypted_store.clear();
+        if (self.memory_store) |*store| {
+            store.clear();
+        }
 
         // Reset state
         self.state = .idle;
+        self.auth_mode = .none;
+        self.token_expiry = 0;
+        self.selected_profile_uuid = null;
         self.freePendingData();
+
+        if (self.available_profiles) |profiles| {
+            self.session_service_client.freeProfiles(profiles);
+            self.available_profiles = null;
+        }
 
         log.info("Logged out successfully", .{});
     }
@@ -491,6 +580,419 @@ pub const AuthManager = struct {
     /// Get error message (if in failed state)
     pub fn getErrorMessage(self: *const Self) ?[]const u8 {
         return self.error_message;
+    }
+
+    /// Get current authentication mode
+    pub fn getAuthMode(self: *const Self) AuthMode {
+        return self.auth_mode;
+    }
+
+    /// Get current credential store type
+    pub fn getStoreType(self: *const Self) AuthCredentialStoreType {
+        return self.store_type;
+    }
+
+    /// Set credential store type
+    /// Migrates existing credentials to the new store
+    pub fn setStoreType(self: *Self, store_type: AuthCredentialStoreType) !void {
+        if (self.store_type == store_type) {
+            log.info("Already using {s} storage", .{store_type.toString()});
+            return;
+        }
+
+        log.info("Switching credential storage from {s} to {s}", .{
+            self.store_type.toString(),
+            store_type.toString(),
+        });
+
+        // Build current credentials for migration
+        const current_creds = EncryptedStoredCredentials{
+            .access_token = self.credentials.access_token,
+            .refresh_token = self.credentials.refresh_token,
+            .expires_at = self.credentials.expires_at,
+            .profile_uuid = self.selected_profile_uuid,
+            .username = self.credentials.username,
+        };
+
+        const has_credentials = current_creds.canRefresh() or current_creds.access_token != null;
+
+        switch (store_type) {
+            .memory => {
+                // Switching to memory-only storage
+                // Initialize memory store if needed
+                if (self.memory_store == null) {
+                    self.memory_store = MemoryCredentialStore.init(self.allocator);
+                }
+
+                // Copy current credentials to memory
+                if (has_credentials) {
+                    try self.memory_store.?.save(&current_creds);
+                }
+
+                // Clear encrypted store (credentials no longer persisted)
+                self.encrypted_store.clear();
+
+                log.warn("Credentials will NOT be persisted. They will be lost on restart.", .{});
+            },
+            .encrypted => {
+                // Switching to encrypted storage
+                if (!self.encrypted_store.isEncryptionAvailable()) {
+                    log.err("Encrypted storage not available (no machine ID)", .{});
+                    return error.EncryptionUnavailable;
+                }
+
+                // Save current credentials to encrypted store
+                if (has_credentials) {
+                    try self.encrypted_store.save(&current_creds);
+                }
+
+                // Clear memory store
+                if (self.memory_store) |*store| {
+                    store.clear();
+                }
+
+                log.info("Credentials will be persisted to encrypted storage", .{});
+            },
+        }
+
+        self.store_type = store_type;
+        log.info("Now using {s} storage", .{store_type.toString()});
+    }
+
+    /// Initialize from encrypted credential store on startup
+    /// Attempts to restore session from stored credentials
+    /// Returns the result of the restoration attempt
+    pub fn initializeFromStore(self: *Self) AuthResult {
+        if (!self.encrypted_store.isEncryptionAvailable()) {
+            log.warn("Encryption not available, cannot restore from store", .{});
+            return .failed;
+        }
+
+        // Load stored credentials
+        var stored = self.encrypted_store.load() orelse {
+            log.debug("No stored credentials found", .{});
+            return .failed;
+        };
+        defer self.encrypted_store.freeCredentials(&stored);
+
+        // Check if we have a refresh token
+        if (!stored.canRefresh()) {
+            log.info("Stored credentials have no refresh token", .{});
+            return .failed;
+        }
+
+        log.info("Found stored credentials, attempting to restore session...", .{});
+
+        // Store the refresh token for use
+        self.pending_refresh_token = self.allocator.dupe(u8, stored.refresh_token.?) catch {
+            log.err("Failed to allocate refresh token", .{});
+            return .failed;
+        };
+
+        // Store the access token if still valid
+        if (stored.isAccessTokenValid()) {
+            if (stored.access_token) |token| {
+                self.pending_access_token = self.allocator.dupe(u8, token) catch null;
+            }
+        }
+
+        // Store profile UUID if we had one selected
+        self.selected_profile_uuid = stored.profile_uuid;
+
+        // Try to refresh tokens first
+        if (!stored.isAccessTokenValid()) {
+            log.info("Access token expired, refreshing...", .{});
+            self.refreshCredentials() catch |err| {
+                log.warn("Failed to refresh tokens: {}", .{err});
+                self.freePendingData();
+                return .failed;
+            };
+        } else {
+            // Update credentials with stored access token
+            if (stored.access_token) |token| {
+                self.credentials.access_token = self.allocator.dupe(u8, token) catch null;
+            }
+            self.credentials.expires_at = stored.expires_at;
+        }
+
+        // Fetch profiles and try to restore session
+        return self.createGameSessionFromOAuth(.oauth_store);
+    }
+
+    /// Create game session from OAuth tokens (internal)
+    fn createGameSessionFromOAuth(self: *Self, mode: AuthMode) AuthResult {
+        const access_token = self.pending_access_token orelse self.credentials.access_token orelse {
+            log.warn("No access token available for session creation", .{});
+            return .failed;
+        };
+
+        // Fetch game profiles
+        const profiles = self.session_service_client.getGameProfiles(access_token) catch |err| {
+            log.warn("Failed to fetch game profiles: {}", .{err});
+            return .failed;
+        };
+
+        // Store profiles
+        if (self.available_profiles) |old| {
+            self.session_service_client.freeProfiles(old);
+        }
+        self.available_profiles = profiles;
+
+        if (profiles.len == 0) {
+            log.warn("No game profiles found for this account", .{});
+            return .failed;
+        }
+
+        // Try auto-select profile
+        if (self.tryAutoSelectProfile(profiles)) |profile| {
+            if (self.completeAuthWithProfile(profile, mode)) {
+                return .success;
+            }
+            return .failed;
+        }
+
+        // Multiple profiles, need selection
+        self.pending_profiles = profiles;
+        self.state = .awaiting_profile_selection;
+
+        log.info("Multiple profiles available. Use '/auth select <username>' to choose:", .{});
+        for (profiles, 0..) |profile, i| {
+            log.info("  [{d}] {s}", .{ i + 1, profile.username });
+        }
+
+        return .pending_profile_selection;
+    }
+
+    /// Try to auto-select a profile based on stored UUID or single profile
+    fn tryAutoSelectProfile(self: *Self, profiles: []const GameProfile) ?GameProfile {
+        // Single profile - auto select
+        if (profiles.len == 1) {
+            log.info("Auto-selected profile: {s}", .{profiles[0].username});
+            return profiles[0];
+        }
+
+        // Check if we have a stored profile UUID
+        if (self.selected_profile_uuid) |stored_uuid| {
+            for (profiles) |profile| {
+                if (std.mem.eql(u8, &profile.uuid, &stored_uuid)) {
+                    log.info("Auto-selected profile from storage: {s}", .{profile.username});
+                    return profile;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    /// Complete authentication with a selected profile
+    fn completeAuthWithProfile(self: *Self, profile: GameProfile, mode: AuthMode) bool {
+        const access_token = self.pending_access_token orelse self.credentials.access_token orelse {
+            log.warn("No access token for profile authentication", .{});
+            return false;
+        };
+
+        // Create game session
+        var game_session = self.session_service_client.createGameSession(
+            access_token,
+            profile.uuid,
+        ) catch |err| {
+            log.warn("Failed to create game session: {}", .{err});
+            return false;
+        };
+        defer self.session_service_client.freeGameSession(&game_session);
+
+        // Update credentials
+        self.credentials.updateFromDeviceFlow(
+            self.allocator,
+            game_session.session_token,
+            game_session.identity_token,
+            access_token,
+            self.pending_refresh_token,
+            profile.username,
+            game_session.expires_at,
+        ) catch |err| {
+            log.err("Failed to update credentials: {}", .{err});
+            return false;
+        };
+
+        // Store profile UUID
+        self.selected_profile_uuid = profile.uuid;
+        self.token_expiry = game_session.expires_at;
+        self.auth_mode = mode;
+        self.state = .authenticated;
+
+        // Save to encrypted storage
+        self.saveToEncryptedStore() catch |err| {
+            log.warn("Failed to save to encrypted store: {}", .{err});
+        };
+
+        log.info("Authentication successful! Mode: {s}", .{mode.toString()});
+        return true;
+    }
+
+    /// Save current credentials to the active store
+    pub fn saveToEncryptedStore(self: *Self) !void {
+        const stored = EncryptedStoredCredentials{
+            .access_token = self.credentials.access_token,
+            .refresh_token = self.credentials.refresh_token,
+            .expires_at = self.credentials.expires_at,
+            .profile_uuid = self.selected_profile_uuid,
+            .username = self.credentials.username,
+        };
+
+        switch (self.store_type) {
+            .encrypted => try self.encrypted_store.save(&stored),
+            .memory => {
+                if (self.memory_store == null) {
+                    self.memory_store = MemoryCredentialStore.init(self.allocator);
+                }
+                try self.memory_store.?.save(&stored);
+            },
+        }
+    }
+
+    /// Check if tokens need refresh and refresh if needed
+    /// Call this periodically (e.g., every minute) to keep session alive
+    pub fn checkAndRefresh(self: *Self) !void {
+        if (self.auth_mode == .none or self.auth_mode == .singleplayer) {
+            return;
+        }
+
+        const now = getTimestamp();
+        const time_until_expiry = self.token_expiry - now;
+
+        // Refresh 300 seconds before expiry (matching Java)
+        if (time_until_expiry <= REFRESH_BUFFER_SECONDS and time_until_expiry > 0) {
+            log.info("Token expiring soon, refreshing...", .{});
+            try self.doRefresh();
+        } else if (time_until_expiry <= 0) {
+            log.warn("Token expired, attempting refresh...", .{});
+            try self.doRefresh();
+        }
+    }
+
+    /// Perform token refresh
+    fn doRefresh(self: *Self) !void {
+        // First try to refresh the game session
+        if (self.credentials.session_token) |session_token| {
+            _ = session_token;
+            // Note: Session refresh API would go here if available
+        }
+
+        // Refresh via OAuth
+        try self.refreshGameSessionViaOAuth();
+    }
+
+    /// Refresh game session using OAuth tokens
+    fn refreshGameSessionViaOAuth(self: *Self) !void {
+        // Only supported for OAuth modes
+        switch (self.auth_mode) {
+            .oauth_browser, .oauth_device, .oauth_store => {},
+            else => {
+                log.warn("Refresh via OAuth not supported for current auth mode", .{});
+                return error.UnsupportedAuthMode;
+            },
+        }
+
+        const profile_uuid = self.selected_profile_uuid orelse {
+            log.warn("No profile selected, cannot refresh game session", .{});
+            return error.NoProfile;
+        };
+
+        // Refresh OAuth tokens first
+        try self.refreshCredentials();
+
+        // Create new game session
+        const access_token = self.credentials.access_token orelse return error.NoAccessToken;
+
+        var game_session = self.session_service_client.createGameSession(
+            access_token,
+            profile_uuid,
+        ) catch |err| {
+            log.err("Failed to create new game session: {}", .{err});
+            return error.SessionCreationFailed;
+        };
+        defer self.session_service_client.freeGameSession(&game_session);
+
+        // Update credentials
+        if (self.credentials.session_token) |old| {
+            self.allocator.free(old);
+        }
+        self.credentials.session_token = try self.allocator.dupe(u8, game_session.session_token);
+
+        if (self.credentials.identity_token) |old| {
+            self.allocator.free(old);
+        }
+        self.credentials.identity_token = try self.allocator.dupe(u8, game_session.identity_token);
+
+        self.credentials.expires_at = game_session.expires_at;
+        self.token_expiry = game_session.expires_at;
+
+        // Save to encrypted storage
+        try self.saveToEncryptedStore();
+
+        log.info("Game session refreshed via OAuth", .{});
+    }
+
+    /// List available profiles (requires valid access token)
+    pub fn listProfiles(self: *Self) ![]const GameProfile {
+        const access_token = self.credentials.access_token orelse {
+            return error.NoAccessToken;
+        };
+
+        const profiles = try self.session_service_client.getGameProfiles(access_token);
+
+        // Update cached profiles
+        if (self.available_profiles) |old| {
+            self.session_service_client.freeProfiles(old);
+        }
+        self.available_profiles = profiles;
+
+        return profiles;
+    }
+
+    /// Select a profile by username
+    pub fn selectProfileByUsername(self: *Self, username: []const u8) !void {
+        const profiles = self.pending_profiles orelse self.available_profiles orelse {
+            return error.NoProfiles;
+        };
+
+        for (profiles) |profile| {
+            if (std.ascii.eqlIgnoreCase(profile.username, username)) {
+                log.info("Selected profile: {s}", .{profile.username});
+
+                if (self.completeAuthWithProfile(profile, self.auth_mode)) {
+                    self.pending_profiles = null;
+                    return;
+                }
+                return error.SessionCreationFailed;
+            }
+        }
+
+        log.warn("No profile found with username: {s}", .{username});
+        return error.ProfileNotFound;
+    }
+
+    /// Get seconds until token expiry
+    pub fn getSecondsUntilExpiry(self: *const Self) i64 {
+        if (self.token_expiry == 0) return 0;
+        const now = getTimestamp();
+        return @max(0, self.token_expiry - now);
+    }
+
+    /// Get authentication status string
+    pub fn getAuthStatus(self: *const Self) []const u8 {
+        if (self.state == .authenticated) {
+            return "authenticated";
+        } else if (self.state == .awaiting_profile_selection) {
+            return "awaiting profile selection";
+        } else if (self.state == .failed) {
+            return "failed";
+        } else if (self.auth_mode == .none) {
+            return "not authenticated";
+        } else {
+            return "partial";
+        }
     }
 };
 
