@@ -1,4 +1,4 @@
-/// UpdateTrails Packet (ID 51)
+/// UpdateTrails Packet (ID 48)
 ///
 /// Sends trail effect definitions to the client.
 /// Trails are visual effects that follow entities/projectiles.
@@ -13,7 +13,7 @@ pub const FXRenderMode = trail.FXRenderMode;
 pub const EdgeData = trail.EdgeData;
 
 // Constants matching Java UpdateTrails.java
-pub const PACKET_ID: u32 = 51;
+pub const PACKET_ID: u32 = 48;
 pub const IS_COMPRESSED: bool = true;
 pub const NULLABLE_BIT_FIELD_SIZE: u32 = 1;
 pub const FIXED_BLOCK_SIZE: u32 = 61;
