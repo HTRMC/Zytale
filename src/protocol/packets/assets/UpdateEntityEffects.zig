@@ -1,4 +1,4 @@
-/// UpdateEntityEffects Packet (ID 50)
+/// UpdateEntityEffects Packet (ID 51)
 ///
 /// Sends entity effect definitions to the client.
 /// Entity effects are status effects that can be applied to entities.
@@ -13,7 +13,7 @@ pub const ValueType = entity_effect.ValueType;
 pub const StatModifier = entity_effect.StatModifier;
 
 // Constants matching Java UpdateEntityEffects.java
-pub const PACKET_ID: u32 = 50;
+pub const PACKET_ID: u32 = 51;
 pub const IS_COMPRESSED: bool = true;
 pub const NULLABLE_BIT_FIELD_SIZE: u32 = 1;
 pub const FIXED_BLOCK_SIZE: u32 = 25;
