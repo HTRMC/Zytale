@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // Protocol module (shared)
     const protocol_module = b.createModule(.{
-        .root_source_file = b.path("src/protocol/registry.zig"),
+        .root_source_file = b.path("src/protocol/PacketRegistry.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -67,7 +67,7 @@ pub fn build(b: *std.Build) void {
 
     // Unit tests - test standalone modules that don't have relative imports
     const test_modules = [_][]const u8{
-        "src/protocol/registry.zig",
+        "src/protocol/PacketRegistry.zig",
         "src/net/packet/varint.zig",
         "src/net/packet/frame.zig",
         "src/world/constants.zig",
