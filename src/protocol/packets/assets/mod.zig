@@ -18,11 +18,11 @@ pub const UpdateTagPatterns = @import("UpdateTagPatterns.zig");
 pub const UpdateTrails = @import("UpdateTrails.zig");
 pub const UpdateEntityEffects = @import("UpdateEntityEffects.zig");
 pub const UpdateEnvironments = @import("UpdateEnvironments.zig");
+pub const UpdateBlockTypes = @import("UpdateBlockTypes.zig");
 
 // ============================================================================
 // Placeholder packets (buildEmptyPacket only)
 // ============================================================================
-pub const UpdateBlockTypes = @import("UpdateBlockTypes.zig");
 pub const UpdateBlockHitboxes = @import("UpdateBlockHitboxes.zig");
 pub const UpdateBlockSoundSets = @import("UpdateBlockSoundSets.zig");
 pub const UpdateItemSoundSets = @import("UpdateItemSoundSets.zig");
@@ -71,6 +71,7 @@ pub const UpdateType = serializer.UpdateType;
 // ============================================================================
 
 /// Build an empty Update* packet for a given asset type
+/// Packet IDs match protocol registry (asset packets: 40-85)
 pub fn buildEmptyPacket(allocator: std.mem.Allocator, packet_id: u32) ![]u8 {
     return switch (packet_id) {
         40 => UpdateBlockTypes.buildEmptyPacket(allocator),
@@ -81,10 +82,10 @@ pub fn buildEmptyPacket(allocator: std.mem.Allocator, packet_id: u32) ![]u8 {
         45 => UpdateBlockBreakingDecals.buildEmptyPacket(allocator),
         46 => UpdateBlockSets.buildEmptyPacket(allocator),
         47 => UpdateWeathers.buildEmptyPacket(allocator),
-        48 => UpdateParticleSystems.buildEmptyPacket(allocator),
-        49 => UpdateParticleSpawners.buildEmptyPacket(allocator),
-        50 => UpdateEntityEffects.buildEmptyPacket(allocator),
-        51 => UpdateTrails.buildEmptyPacket(allocator),
+        48 => UpdateTrails.buildEmptyPacket(allocator),
+        49 => UpdateParticleSystems.buildEmptyPacket(allocator),
+        50 => UpdateParticleSpawners.buildEmptyPacket(allocator),
+        51 => UpdateEntityEffects.buildEmptyPacket(allocator),
         52 => UpdateItemPlayerAnimations.buildEmptyPacket(allocator),
         53 => UpdateModelvfxs.buildEmptyPacket(allocator),
         54 => UpdateItems.buildEmptyPacket(allocator),
@@ -102,14 +103,15 @@ pub fn buildEmptyPacket(allocator: std.mem.Allocator, packet_id: u32) ![]u8 {
         66 => UpdateInteractions.buildEmptyPacket(allocator),
         67 => UpdateRootInteractions.buildEmptyPacket(allocator),
         68 => UpdateUnarmedInteractions.buildEmptyPacket(allocator),
-        69 => UpdateEntityStatTypes.buildEmptyPacket(allocator),
-        70 => UpdateEntityUIComponents.buildEmptyPacket(allocator),
-        71 => UpdateHitboxCollisionConfig.buildEmptyPacket(allocator),
-        72 => UpdateRepulsionConfig.buildEmptyPacket(allocator),
-        73 => UpdateViewBobbing.buildEmptyPacket(allocator),
-        74 => UpdateCameraShake.buildEmptyPacket(allocator),
-        75 => UpdateBlockGroups.buildEmptyPacket(allocator),
-        76 => UpdateSoundSets.buildEmptyPacket(allocator),
+        // 69-71 are objective tracking packets, not asset packets
+        72 => UpdateEntityStatTypes.buildEmptyPacket(allocator),
+        73 => UpdateEntityUIComponents.buildEmptyPacket(allocator),
+        74 => UpdateHitboxCollisionConfig.buildEmptyPacket(allocator),
+        75 => UpdateRepulsionConfig.buildEmptyPacket(allocator),
+        76 => UpdateViewBobbing.buildEmptyPacket(allocator),
+        77 => UpdateCameraShake.buildEmptyPacket(allocator),
+        78 => UpdateBlockGroups.buildEmptyPacket(allocator),
+        79 => UpdateSoundSets.buildEmptyPacket(allocator),
         80 => UpdateAudioCategories.buildEmptyPacket(allocator),
         81 => UpdateReverbEffects.buildEmptyPacket(allocator),
         82 => UpdateEqualizerEffects.buildEmptyPacket(allocator),
@@ -180,7 +182,8 @@ test "buildEmptyPacket for common types" {
     defer allocator.free(audio_pkt);
     try std.testing.expectEqual(@as(usize, 7), audio_pkt.len);
 
-    const trails_pkt = try buildEmptyPacket(allocator, 51);
+    // Trails is packet ID 48 (not 51)
+    const trails_pkt = try buildEmptyPacket(allocator, 48);
     defer allocator.free(trails_pkt);
     try std.testing.expectEqual(@as(usize, 3), trails_pkt.len);
 
