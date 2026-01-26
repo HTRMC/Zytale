@@ -56,7 +56,53 @@ pub const AudioCategoryAsset = struct {
         allocator.free(self.id);
         if (self.parent) |p| allocator.free(p);
     }
+
+    /// Protocol serialization constants
+    pub const NULLABLE_BIT_FIELD_SIZE: u32 = 1;
+    pub const FIXED_BLOCK_SIZE: u32 = 5;
+    pub const VARIABLE_FIELD_COUNT: u32 = 1;
+    pub const VARIABLE_BLOCK_START: u32 = 5;
+
+    /// Serialize to protocol format
+    /// Format: nullBits(1) + volume(4) + if bit 0: VarString id
+    pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
+        var buf = std.ArrayListUnmanaged(u8){};
+        errdefer buf.deinit(allocator);
+
+        // nullBits
+        var null_bits: u8 = 0;
+        if (self.id.len > 0) null_bits |= 0x01;
+        try buf.append(allocator, null_bits);
+
+        // volume (4 bytes f32 LE)
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, @bitCast(self.volume), .little);
+        try buf.appendSlice(allocator, &bytes);
+
+        // id string (if present)
+        if (self.id.len > 0) {
+            // VarInt length
+            var vi_buf: [5]u8 = undefined;
+            const vi_len = writeVarIntBuf(&vi_buf, @intCast(self.id.len));
+            try buf.appendSlice(allocator, vi_buf[0..vi_len]);
+            try buf.appendSlice(allocator, self.id);
+        }
+
+        return buf.toOwnedSlice(allocator);
+    }
 };
+
+fn writeVarIntBuf(buf: *[5]u8, value: i32) usize {
+    var v: u32 = @bitCast(value);
+    var i: usize = 0;
+    while (v >= 0x80) {
+        buf[i] = @truncate((v & 0x7F) | 0x80);
+        v >>= 7;
+        i += 1;
+    }
+    buf[i] = @truncate(v);
+    return i + 1;
+}
 
 test "AudioCategoryAsset parse basic" {
     const allocator = std.testing.allocator;
