@@ -21,6 +21,7 @@ pub const CredentialSource = enum {
     environment,
     disk,
     device_flow,
+    encrypted_store,
 };
 
 /// Server credentials required for authenticated handshake with Session Service
@@ -224,6 +225,7 @@ pub const ServerCredentials = struct {
             .environment => "environment",
             .disk => "disk",
             .device_flow => "device flow",
+            .encrypted_store => "encrypted store",
         };
         std.debug.print("    Source: {s}\n", .{source_str});
 

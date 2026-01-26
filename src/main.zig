@@ -76,20 +76,39 @@ fn runServer(allocator: std.mem.Allocator) !void {
     defer console.deinit();
     try console.start();
 
-    // If we have valid credentials from disk, mark as authenticated
-    if (server_creds.isValid()) {
-        std.debug.print("  Auth: Loaded credentials for {s}\n", .{server_creds.username orelse "unknown"});
-    } else if (server_creds.refresh_token != null) {
-        // Try to refresh expired tokens
-        std.debug.print("  Auth: Attempting to refresh expired tokens...\n", .{});
-        auth_manager.refreshCredentials() catch |err| {
-            std.debug.print("  Auth: Token refresh failed: {}. Use /auth login device\n", .{err});
-        };
-    } else {
-        // No credentials, create local session for development
-        std.debug.print("  Auth: No credentials found. Creating local session for development.\n", .{});
-        std.debug.print("        Use /auth login device for authenticated mode.\n", .{});
-        try auth_manager.createLocalSession("ServerHost");
+    // Try to restore session from encrypted storage first
+    std.debug.print("  Auth: Checking for stored credentials...\n", .{});
+    const restore_result = auth_manager.initializeFromStore();
+
+    switch (restore_result) {
+        .success => {
+            std.debug.print("  Auth: Session restored from encrypted storage\n", .{});
+            std.debug.print("        Logged in as: {s} (mode: {s})\n", .{
+                server_creds.username orelse "unknown",
+                auth_manager.getAuthMode().toString(),
+            });
+        },
+        .pending_profile_selection => {
+            std.debug.print("  Auth: Session restored but profile selection required\n", .{});
+            std.debug.print("        Use /auth select <username> to choose a profile\n", .{});
+        },
+        .failed => {
+            // Fall back to legacy credentials or fresh start
+            if (server_creds.isValid()) {
+                std.debug.print("  Auth: Loaded credentials for {s}\n", .{server_creds.username orelse "unknown"});
+            } else if (server_creds.refresh_token != null) {
+                // Try to refresh expired tokens
+                std.debug.print("  Auth: Attempting to refresh expired tokens...\n", .{});
+                auth_manager.refreshCredentials() catch |err| {
+                    std.debug.print("  Auth: Token refresh failed: {}. Use /auth login device\n", .{err});
+                };
+            } else {
+                // No credentials, create local session for development
+                std.debug.print("  Auth: No credentials found. Creating local session for development.\n", .{});
+                std.debug.print("        Use /auth login device for authenticated mode.\n", .{});
+                try auth_manager.createLocalSession("ServerHost");
+            }
+        },
     }
 
     // Initialize world

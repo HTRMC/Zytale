@@ -12,3 +12,7 @@ zig-cache/
 Thumbs.db
 /HytaleServerSource
 /compiler
+auth.enc
+CLAUDE.md
+.machine_id
+/.claude
