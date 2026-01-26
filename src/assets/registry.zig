@@ -20,6 +20,7 @@ const equalizer_effect = @import("types/equalizer_effect.zig");
 const tag_pattern = @import("types/tag_pattern.zig");
 const trail = @import("types/trail.zig");
 const entity_effect = @import("types/entity_effect.zig");
+const block_type = @import("types/block_type.zig");
 
 const log = std.log.scoped(.asset_registry);
 
@@ -466,6 +467,7 @@ pub const AssetRegistry = struct {
         }
 
         // Generate packets for implemented asset types
+        try self.generateBlockTypesPacket(&packets);
         try self.generateAudioCategoriesPacket(&packets);
         try self.generateReverbEffectsPacket(&packets);
         try self.generateEqualizerEffectsPacket(&packets);
@@ -701,11 +703,43 @@ pub const AssetRegistry = struct {
         });
     }
 
+    /// Generate block types packet with basic blocks for flat world
+    fn generateBlockTypesPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
+        const BlockTypeAsset = block_type.BlockTypeAsset;
+        const BlockTypeEntry = asset_packets.UpdateBlockTypes.BlockTypeEntry;
+
+        // Define basic block types matching constants.BlockId
+        // AIR = 0, BEDROCK = 1, STONE = 2, DIRT = 3, GRASS = 4
+        var entries: [5]BlockTypeEntry = undefined;
+        entries[0] = .{ .id = 0, .block_type = BlockTypeAsset.air() };
+        entries[1] = .{ .id = 1, .block_type = try BlockTypeAsset.solid(self.allocator, "Bedrock") };
+        entries[2] = .{ .id = 2, .block_type = try BlockTypeAsset.solid(self.allocator, "Stone") };
+        entries[3] = .{ .id = 3, .block_type = try BlockTypeAsset.solid(self.allocator, "Dirt") };
+        entries[4] = .{ .id = 4, .block_type = try BlockTypeAsset.solid(self.allocator, "Grass") };
+
+        const payload = try asset_packets.UpdateBlockTypes.serialize(
+            self.allocator,
+            .init,
+            4, // maxId = 4 (GRASS)
+            &entries,
+        );
+
+        try packets.append(self.allocator, .{
+            .packet_id = asset_packets.UpdateBlockTypes.PACKET_ID,
+            .payload = payload,
+        });
+
+        log.debug("Generated UpdateBlockTypes: {d} entries, {d} bytes", .{
+            entries.len,
+            payload.len,
+        });
+    }
+
     /// Generate empty packets for all required asset types not yet implemented
     fn generateEmptyPackets(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
         // Asset types that still need empty packets (not implemented yet)
         const all_types = [_]AssetType{
-            .block_types,
+            // .block_types - now generated with data
             .block_hitboxes,
             .block_sound_sets,
             .item_sound_sets,
