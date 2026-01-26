@@ -6,6 +6,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
+// Protocol constants - must match Java BlockType.java
+pub const NULLABLE_BIT_FIELD_SIZE: u32 = 4;
+pub const FIXED_BLOCK_SIZE: u32 = 163;
+pub const VARIABLE_FIELD_COUNT: u32 = 24;
+pub const VARIABLE_BLOCK_START: u32 = 259;
+
 /// Draw type for blocks
 /// Values must match com/hypixel/hytale/protocol/DrawType.java
 pub const DrawType = enum(u8) {
@@ -79,6 +85,72 @@ pub const Rotation = enum(u8) {
 pub const BlockSupportsRequiredForType = enum(u8) {
     any = 0,
     // Add more as needed
+};
+
+/// RGB Color (3 bytes)
+pub const Color = struct {
+    r: u8 = 0,
+    g: u8 = 0,
+    b: u8 = 0,
+
+    pub fn serialize(self: *const Color, buf: *std.ArrayListUnmanaged(u8), allocator: Allocator) !void {
+        try buf.append(allocator, self.r);
+        try buf.append(allocator, self.g);
+        try buf.append(allocator, self.b);
+    }
+};
+
+/// Color with light radius (4 bytes)
+pub const ColorLight = struct {
+    radius: u8 = 0,
+    r: u8 = 0,
+    g: u8 = 0,
+    b: u8 = 0,
+
+    pub fn serialize(self: *const ColorLight, buf: *std.ArrayListUnmanaged(u8), allocator: Allocator) !void {
+        try buf.append(allocator, self.radius);
+        try buf.append(allocator, self.r);
+        try buf.append(allocator, self.g);
+        try buf.append(allocator, self.b);
+    }
+};
+
+/// Tint for block faces (24 bytes - 6 faces x 4 bytes each)
+pub const Tint = struct {
+    data: [24]u8 = [_]u8{0} ** 24,
+
+    pub fn serialize(self: *const Tint, buf: *std.ArrayListUnmanaged(u8), allocator: Allocator) !void {
+        try buf.appendSlice(allocator, &self.data);
+    }
+};
+
+/// Block movement settings (42 bytes)
+pub const BlockMovementSettings = struct {
+    data: [42]u8 = [_]u8{0} ** 42,
+
+    pub fn serialize(self: *const BlockMovementSettings, buf: *std.ArrayListUnmanaged(u8), allocator: Allocator) !void {
+        try buf.appendSlice(allocator, &self.data);
+    }
+};
+
+/// Block flags (2 bytes)
+pub const BlockFlags = struct {
+    value: u16 = 0,
+
+    pub fn serialize(self: *const BlockFlags, buf: *std.ArrayListUnmanaged(u8), allocator: Allocator) !void {
+        var bytes: [2]u8 = undefined;
+        std.mem.writeInt(u16, &bytes, self.value, .little);
+        try buf.appendSlice(allocator, &bytes);
+    }
+};
+
+/// Block placement settings (16 bytes)
+pub const BlockPlacementSettings = struct {
+    data: [16]u8 = [_]u8{0} ** 16,
+
+    pub fn serialize(self: *const BlockPlacementSettings, buf: *std.ArrayListUnmanaged(u8), allocator: Allocator) !void {
+        try buf.appendSlice(allocator, &self.data);
+    }
 };
 
 /// Cube textures - 6 face textures for a cube block
@@ -217,10 +289,20 @@ pub const BlockTextures = struct {
 
 /// Block type asset
 pub const BlockTypeAsset = struct {
-    // Optional fields (null = not present in nullBits)
+    // Optional variable fields (null = not present in nullBits)
     item: ?[]const u8 = null,
     name: ?[]const u8 = null,
     cube_textures: ?BlockTextures = null,
+
+    // Optional inline fields (null = not present in nullBits)
+    // These fields have fixed sizes but are still nullable
+    particle_color: ?Color = null,
+    light: ?ColorLight = null,
+    tint: ?Tint = null,
+    biome_tint: ?Tint = null,
+    movement_settings: ?BlockMovementSettings = null,
+    flags: ?BlockFlags = null,
+    placement_settings: ?BlockPlacementSettings = null,
 
     // Required fields with defaults
     unknown: bool = false,
@@ -249,6 +331,11 @@ pub const BlockTypeAsset = struct {
 
     /// Serialize to protocol format
     /// Returns the serialized bytes
+    /// Layout matches Java BlockType.java exactly:
+    /// - Bytes 0-3: nullBits[4]
+    /// - Bytes 4-162: Fixed inline fields (159 bytes)
+    /// - Bytes 163-258: 24 offset slots (4 bytes each = 96 bytes)
+    /// - Byte 259+: Variable block data
     pub fn serialize(self: *const Self, allocator: Allocator) ![]u8 {
         // Validation: Empty blocks (air) MUST NOT have a name
         // The client validates: if drawType == empty && name != null, it throws
@@ -260,20 +347,35 @@ pub const BlockTypeAsset = struct {
         var buf = std.ArrayListUnmanaged(u8){};
         errdefer buf.deinit(allocator);
 
-        // Calculate nullBits
+        // Calculate nullBits - must match Java BlockType.java lines 1047-1169
         var null_bits: [4]u8 = .{ 0, 0, 0, 0 };
 
-        // Bit 7 of byte 0 = item present (0x80)
-        if (self.item != null) null_bits[0] |= 0x80;
-        // Bit 0 of byte 1 = name present (0x01)
-        if (self.name != null) null_bits[1] |= 0x01;
-        // Bit 7 of byte 1 = cubeTextures present (0x80) - matches Java BlockType.java line 1107-1109
-        if (self.cube_textures != null) null_bits[1] |= 0x80;
+        // Byte 0 inline fields
+        if (self.particle_color != null) null_bits[0] |= 0x01; // bit 0
+        if (self.light != null) null_bits[0] |= 0x02; // bit 1
+        if (self.tint != null) null_bits[0] |= 0x04; // bit 2
+        if (self.biome_tint != null) null_bits[0] |= 0x08; // bit 3
+        if (self.movement_settings != null) null_bits[0] |= 0x10; // bit 4
+        if (self.flags != null) null_bits[0] |= 0x20; // bit 5
+        if (self.placement_settings != null) null_bits[0] |= 0x40; // bit 6
+        if (self.item != null) null_bits[0] |= 0x80; // bit 7
+
+        // Byte 1 variable fields
+        if (self.name != null) null_bits[1] |= 0x01; // bit 0
+        // shaderEffect (bit 1) - not implemented
+        // model (bit 2) - not implemented
+        // modelTexture (bit 3) - not implemented
+        // modelAnimation (bit 4) - not implemented
+        // support (bit 5) - not implemented
+        // supporting (bit 6) - not implemented
+        if (self.cube_textures != null) null_bits[1] |= 0x80; // bit 7
+
+        // Byte 2 and 3 - not implemented, leave as 0
 
         // Write nullBits (4 bytes)
         try buf.appendSlice(allocator, &null_bits);
 
-        // Fixed fields
+        // Fixed fields (159 bytes total)
         try buf.append(allocator, if (self.unknown) 1 else 0);
         try buf.append(allocator, @intFromEnum(self.draw_type));
         try buf.append(allocator, @intFromEnum(self.material));
@@ -306,90 +408,116 @@ pub const BlockTypeAsset = struct {
         // ambientSoundEventIndex (i32 LE)
         try writeI32(&buf, allocator, self.ambient_sound_event_index);
 
-        // particleColor (3 bytes) - null, write zeros
-        try buf.appendNTimes(allocator, 0, 3);
-        // light (4 bytes) - null, write zeros
-        try buf.appendNTimes(allocator, 0, 4);
-        // tint (24 bytes) - null, write zeros
-        try buf.appendNTimes(allocator, 0, 24);
-        // biomeTint (24 bytes) - null, write zeros
-        try buf.appendNTimes(allocator, 0, 24);
+        // particleColor (3 bytes) - serialize if present, otherwise zeros
+        if (self.particle_color) |*pc| {
+            try pc.serialize(&buf, allocator);
+        } else {
+            try buf.appendNTimes(allocator, 0, 3);
+        }
+
+        // light (4 bytes) - serialize if present, otherwise zeros
+        if (self.light) |*l| {
+            try l.serialize(&buf, allocator);
+        } else {
+            try buf.appendNTimes(allocator, 0, 4);
+        }
+
+        // tint (24 bytes) - serialize if present, otherwise zeros
+        if (self.tint) |*t| {
+            try t.serialize(&buf, allocator);
+        } else {
+            try buf.appendNTimes(allocator, 0, 24);
+        }
+
+        // biomeTint (24 bytes) - serialize if present, otherwise zeros
+        if (self.biome_tint) |*bt| {
+            try bt.serialize(&buf, allocator);
+        } else {
+            try buf.appendNTimes(allocator, 0, 24);
+        }
 
         // group (i32 LE)
         try writeI32(&buf, allocator, self.group);
 
-        // movementSettings (42 bytes) - null, write zeros
-        try buf.appendNTimes(allocator, 0, 42);
-        // flags (2 bytes) - null, write zeros
-        try buf.appendNTimes(allocator, 0, 2);
-        // placementSettings (16 bytes) - null, write zeros
-        try buf.appendNTimes(allocator, 0, 16);
+        // movementSettings (42 bytes) - serialize if present, otherwise zeros
+        if (self.movement_settings) |*ms| {
+            try ms.serialize(&buf, allocator);
+        } else {
+            try buf.appendNTimes(allocator, 0, 42);
+        }
+
+        // flags (2 bytes) - serialize if present, otherwise zeros
+        if (self.flags) |*f| {
+            try f.serialize(&buf, allocator);
+        } else {
+            try buf.appendNTimes(allocator, 0, 2);
+        }
+
+        // placementSettings (16 bytes) - serialize if present, otherwise zeros
+        if (self.placement_settings) |*ps| {
+            try ps.serialize(&buf, allocator);
+        } else {
+            try buf.appendNTimes(allocator, 0, 16);
+        }
 
         // ignoreSupportWhenPlaced (bool)
         try buf.append(allocator, if (self.ignore_support_when_placed) 1 else 0);
         // transitionToTag (i32 LE)
         try writeI32(&buf, allocator, self.transition_to_tag);
 
-        // Record position for variable block start
-        const fixed_end = buf.items.len;
+        // At this point we should be at byte 163 (FIXED_BLOCK_SIZE)
+        // Write all 24 offset slots as placeholders (initialized to 0)
+        // We'll set each to -1 or actual offset afterwards
+        const offset_slots_start = buf.items.len;
+        try buf.appendNTimes(allocator, 0, 96); // 24 * 4 bytes
 
-        // 24 offset slots for variable fields (all -1 = not present)
-        // item, name, shaderEffect, model, modelTexture, modelAnimation,
-        // support, supporting, cubeTextures, cubeSideMaskTexture, particles,
-        // blockParticleSetId, blockBreakingDecalId, transitionTexture,
-        // transitionToGroups, interactionHint, gathering, display, rail,
-        // interactions, states, tagIndexes, bench, connectedBlockRuleSet
-        const item_offset_pos = buf.items.len;
-        try buf.appendNTimes(allocator, 0, 4); // item
-        const name_offset_pos = buf.items.len;
-        try buf.appendNTimes(allocator, 0, 4); // name
-        // Skip 6 offset slots (shaderEffect, model, modelTexture, modelAnimation, support, supporting)
-        try buf.appendNTimes(allocator, 0, 24); // 6 * 4 bytes
-        const cube_textures_offset_pos = buf.items.len;
-        try buf.appendNTimes(allocator, 0, 4); // cubeTextures
-
-        // Remaining 15 offset slots - all -1
-        // (cubeSideMaskTexture, particles, blockParticleSetId, blockBreakingDecalId,
-        //  transitionTexture, transitionToGroups, interactionHint, gathering, display,
-        //  rail, interactions, states, tagIndexes, bench, connectedBlockRuleSet)
-        for (0..15) |_| {
-            try writeI32(&buf, allocator, -1);
-        }
-
-        // Variable block start position
+        // Variable block starts at byte 259 (VARIABLE_BLOCK_START)
         const var_block_start = buf.items.len;
 
-        // Write variable fields
+        // Helper to set an offset slot value
+        const setOffsetSlot = struct {
+            fn call(buffer: *std.ArrayListUnmanaged(u8), slots_start: usize, slot: usize, value: i32) void {
+                const pos = slots_start + (slot * 4);
+                std.mem.writeInt(i32, buffer.items[pos..][0..4], value, .little);
+            }
+        }.call;
+
+        // Initialize ALL 24 offset slots to -1 (null)
+        // This is CRITICAL - Java does the same and the client expects -1 for null fields
+        for (0..24) |slot| {
+            setOffsetSlot(&buf, offset_slots_start, slot, -1);
+        }
+
+        // Slot 0: item
         if (self.item) |item_str| {
             const offset: i32 = @intCast(buf.items.len - var_block_start);
-            std.mem.writeInt(i32, buf.items[item_offset_pos..][0..4], offset, .little);
+            setOffsetSlot(&buf, offset_slots_start, 0, offset);
             try writeVarString(&buf, allocator, item_str);
-        } else {
-            std.mem.writeInt(i32, buf.items[item_offset_pos..][0..4], -1, .little);
         }
 
+        // Slot 1: name
         if (self.name) |name_str| {
             const offset: i32 = @intCast(buf.items.len - var_block_start);
-            std.mem.writeInt(i32, buf.items[name_offset_pos..][0..4], offset, .little);
+            setOffsetSlot(&buf, offset_slots_start, 1, offset);
             try writeVarString(&buf, allocator, name_str);
-        } else {
-            std.mem.writeInt(i32, buf.items[name_offset_pos..][0..4], -1, .little);
         }
 
+        // Slots 2-7: shaderEffect, model, modelTexture, modelAnimation, support, supporting
+        // Already set to -1 above, no implementation needed
+
+        // Slot 8: cubeTextures
         if (self.cube_textures) |*cube_tex| {
             const offset: i32 = @intCast(buf.items.len - var_block_start);
-            std.mem.writeInt(i32, buf.items[cube_textures_offset_pos..][0..4], offset, .little);
+            setOffsetSlot(&buf, offset_slots_start, 8, offset);
             // Write VarInt count (always 1 for single texture set)
             try writeVarInt(&buf, allocator, 1);
             // Write BlockTextures data
             const cube_data = try cube_tex.serialize(allocator);
             defer allocator.free(cube_data);
             try buf.appendSlice(allocator, cube_data);
-        } else {
-            std.mem.writeInt(i32, buf.items[cube_textures_offset_pos..][0..4], -1, .little);
         }
 
-        _ = fixed_end;
+        // Slots 9-23: remaining fields - already set to -1 above
 
         return buf.toOwnedSlice(allocator);
     }
@@ -469,6 +597,23 @@ test "BlockTypeAsset air serialization" {
     try std.testing.expectEqual(@as(u8, 0), data[5]); // draw_type = empty
 }
 
+test "all 24 offset slots are -1 for air block" {
+    const allocator = std.testing.allocator;
+
+    const air_block = BlockTypeAsset.air();
+    const data = try air_block.serialize(allocator);
+    defer allocator.free(data);
+
+    // Offset slots start at byte 163 (FIXED_BLOCK_SIZE)
+    // Each slot is 4 bytes, so slots 0-23 are at bytes 163-258
+    // For air block, ALL slots must be -1 (0xFFFFFFFF)
+    for (0..24) |slot| {
+        const slot_pos = FIXED_BLOCK_SIZE + (slot * 4);
+        const slot_value = std.mem.readInt(i32, data[slot_pos..][0..4], .little);
+        try std.testing.expectEqual(@as(i32, -1), slot_value);
+    }
+}
+
 test "BlockTypeAsset empty block with name should fail" {
     const allocator = std.testing.allocator;
 
@@ -495,6 +640,46 @@ test "BlockTypeAsset solid serialization" {
     // Verify draw_type is cube (2) at byte offset 5 (after 4 nullBits + 1 unknown)
     // This must be 2 to match Java's DrawType.Cube
     try std.testing.expectEqual(@as(u8, 2), data[5]);
+}
+
+test "solid block has correct offset for name and cubeTextures" {
+    const allocator = std.testing.allocator;
+
+    var stone = try BlockTypeAsset.solid(allocator, "Stone");
+    defer if (stone.cube_textures) |*tex| tex.deinit(allocator);
+    const data = try stone.serialize(allocator);
+    defer allocator.free(data);
+
+    // Verify nullBits: name (byte 1, bit 0) and cubeTextures (byte 1, bit 7) should be set
+    try std.testing.expectEqual(@as(u8, 0x81), data[1]); // name(0x01) | cubeTextures(0x80)
+
+    // Helper to read offset slot value
+    const readOffsetSlot = struct {
+        fn call(buf: []const u8, slot: usize) i32 {
+            const slot_pos = FIXED_BLOCK_SIZE + (slot * 4);
+            return std.mem.readInt(i32, buf[slot_pos..][0..4], .little);
+        }
+    }.call;
+
+    // Slot 0 (item): should be -1 (no item)
+    try std.testing.expectEqual(@as(i32, -1), readOffsetSlot(data, 0));
+
+    // Slot 1 (name): should be 0 (first variable field, starts at var block start)
+    try std.testing.expectEqual(@as(i32, 0), readOffsetSlot(data, 1));
+
+    // Slots 2-7 (shaderEffect through supporting): should ALL be -1
+    for (2..8) |slot| {
+        try std.testing.expectEqual(@as(i32, -1), readOffsetSlot(data, slot));
+    }
+
+    // Slot 8 (cubeTextures): should be > 0 (comes after the name string)
+    const cube_textures_offset = readOffsetSlot(data, 8);
+    try std.testing.expect(cube_textures_offset > 0);
+
+    // Slots 9-23: should ALL be -1
+    for (9..24) |slot| {
+        try std.testing.expectEqual(@as(i32, -1), readOffsetSlot(data, slot));
+    }
 }
 
 test "DrawType enum values match Java protocol" {
