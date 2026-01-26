@@ -49,6 +49,7 @@ pub const reverb_effect = @import("types/reverb_effect.zig");
 pub const equalizer_effect = @import("types/equalizer_effect.zig");
 pub const tag_pattern = @import("types/tag_pattern.zig");
 pub const trail = @import("types/trail.zig");
+pub const block_type = @import("types/block_type.zig");
 
 // Asset types
 pub const AudioCategoryAsset = audio_category.AudioCategoryAsset;
@@ -59,6 +60,7 @@ pub const TagPatternType = tag_pattern.TagPatternType;
 pub const TrailAsset = trail.TrailAsset;
 pub const FXRenderMode = trail.FXRenderMode;
 pub const EdgeData = trail.EdgeData;
+pub const BlockTypeAsset = block_type.BlockTypeAsset;
 
 // JSON parsing utilities
 pub const json = @import("json.zig");
