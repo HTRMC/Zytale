@@ -34,13 +34,13 @@ pub fn serialize(
     allocator: std.mem.Allocator,
     update_type: serializer.UpdateType,
     max_id: u32,
-    entries: []const SoundEventEntry,
+    entries: ?[]const SoundEventEntry,
 ) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8){};
     errdefer buf.deinit(allocator);
 
     // nullBits: bit 0 = soundEvents present
-    const null_bits: u8 = if (entries.len > 0) 0x01 else 0x00;
+    const null_bits: u8 = if (entries != null) 0x01 else 0x00;
     try buf.append(allocator, null_bits);
 
     // type (UpdateType)
@@ -52,14 +52,14 @@ pub fn serialize(
     try buf.appendSlice(allocator, &max_id_bytes);
 
     // soundEvents dictionary (if present)
-    if (entries.len > 0) {
+    if (entries) |ents| {
         // VarInt count
         var vi_buf: [5]u8 = undefined;
-        const vi_len = serializer.writeVarInt(&vi_buf, @intCast(entries.len));
+        const vi_len = serializer.writeVarInt(&vi_buf, @intCast(ents.len));
         try buf.appendSlice(allocator, vi_buf[0..vi_len]);
 
         // Each entry: i32 key + SoundEvent data
-        for (entries) |entry| {
+        for (ents) |entry| {
             // Key (i32 LE)
             var key_bytes: [4]u8 = undefined;
             std.mem.writeInt(i32, &key_bytes, @intCast(entry.id), .little);
@@ -75,16 +75,11 @@ pub fn serialize(
     return buf.toOwnedSlice(allocator);
 }
 
-/// Build empty packet (7 bytes)
-pub fn buildEmptyPacket(allocator: std.mem.Allocator) ![]u8 {
-    return serializer.serializeEmptyUpdate(allocator, .init, 0, &[_]u8{});
-}
-
 test "UpdateSoundEvents empty packet size" {
     const allocator = std.testing.allocator;
-    const pkt = try buildEmptyPacket(allocator);
+    const pkt = try serialize(allocator, .init, 0, null);
     defer allocator.free(pkt);
-    try std.testing.expectEqual(@as(usize, 7), pkt.len);
+    try std.testing.expectEqual(@as(usize, 6), pkt.len);
 }
 
 test "UpdateSoundEvents with entries" {

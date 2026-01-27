@@ -71,22 +71,23 @@ pub const SetChunk = struct {
         offset += 4;
 
         // Calculate offsets for variable data
-        var var_offset: i32 = @intCast(HEADER_SIZE);
+        // IMPORTANT: Offsets are RELATIVE to variable block start (position 25), not absolute!
+        // See Java SetChunk.java line 197: buf.writerIndex() - varBlockStart
+        var relative_offset: i32 = 0;
         var local_light_offset: i32 = -1;
         var global_light_offset: i32 = -1;
         var data_offset: i32 = -1;
 
         if (self.local_light) |light| {
-            local_light_offset = var_offset;
-            var_offset += @intCast(varint.varIntSize(@intCast(light.len)) + light.len);
+            local_light_offset = relative_offset;
+            relative_offset += @intCast(varint.varIntSize(@intCast(light.len)) + light.len);
         }
         if (self.global_light) |light| {
-            global_light_offset = var_offset;
-            var_offset += @intCast(varint.varIntSize(@intCast(light.len)) + light.len);
+            global_light_offset = relative_offset;
+            relative_offset += @intCast(varint.varIntSize(@intCast(light.len)) + light.len);
         }
-        if (self.section_data) |data| {
-            data_offset = var_offset;
-            _ = data;
+        if (self.section_data) |_| {
+            data_offset = relative_offset;
         }
 
         // Write offsets
@@ -343,7 +344,7 @@ pub const JoinWorld = struct {
     }
 };
 
-test "set chunk serialization" {
+test "set chunk serialization empty" {
     const allocator = std.testing.allocator;
 
     const packet = SetChunk{
@@ -358,11 +359,56 @@ test "set chunk serialization" {
     const data = try packet.serialize(allocator);
     defer allocator.free(data);
 
-    // Check header
-    try std.testing.expectEqual(@as(u8, 0x00), data[0]); // no data
+    // Check header size (25 bytes)
+    try std.testing.expectEqual(@as(usize, 25), data.len);
+
+    // Check null bits (no data)
+    try std.testing.expectEqual(@as(u8, 0x00), data[0]);
+
+    // Check coordinates
     try std.testing.expectEqual(@as(i32, 5), std.mem.readInt(i32, data[1..5], .little));
     try std.testing.expectEqual(@as(i32, 2), std.mem.readInt(i32, data[5..9], .little));
     try std.testing.expectEqual(@as(i32, -3), std.mem.readInt(i32, data[9..13], .little));
+
+    // Check offsets are all -1 (no data)
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, data[13..17], .little)); // localLight
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, data[17..21], .little)); // globalLight
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, data[21..25], .little)); // data
+}
+
+test "set chunk serialization with section data" {
+    const allocator = std.testing.allocator;
+
+    // Create a minimal section data (just 3 bytes for empty section)
+    const section_data = [_]u8{ 0, 0, 0 }; // 3 empty palette types
+
+    const packet = SetChunk{
+        .chunk_x = 0,
+        .section_y = 0,
+        .chunk_z = 0,
+        .section_data = &section_data,
+        .local_light = null,
+        .global_light = null,
+    };
+
+    const data = try packet.serialize(allocator);
+    defer allocator.free(data);
+
+    // Check null bits (bit 2 = data present)
+    try std.testing.expectEqual(@as(u8, 0x04), data[0]);
+
+    // Check offsets - data offset should be 0 (relative to variable block start)
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, data[13..17], .little)); // localLight
+    try std.testing.expectEqual(@as(i32, -1), std.mem.readInt(i32, data[17..21], .little)); // globalLight
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, data[21..25], .little)); // data offset = 0 (relative)
+
+    // Verify section data is written after header
+    // Header is 25 bytes, then VarInt(3) = 1 byte, then 3 bytes of data
+    try std.testing.expectEqual(@as(usize, 25 + 1 + 3), data.len);
+    try std.testing.expectEqual(@as(u8, 3), data[25]); // VarInt length = 3
+    try std.testing.expectEqual(@as(u8, 0), data[26]); // empty block palette type
+    try std.testing.expectEqual(@as(u8, 0), data[27]); // empty filler palette type
+    try std.testing.expectEqual(@as(u8, 0), data[28]); // empty rotation palette type
 }
 
 test "join world serialization" {

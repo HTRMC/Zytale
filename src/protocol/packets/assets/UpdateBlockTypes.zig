@@ -37,13 +37,13 @@ pub fn serialize(
     allocator: std.mem.Allocator,
     update_type: serializer.UpdateType,
     max_id: u32,
-    entries: []const BlockTypeEntry,
+    entries: ?[]const BlockTypeEntry,
 ) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8){};
     errdefer buf.deinit(allocator);
 
     // nullBits: bit 0 = blockTypes present
-    const null_bits: u8 = if (entries.len > 0) 0x01 else 0x00;
+    const null_bits: u8 = if (entries != null) 0x01 else 0x00;
     try buf.append(allocator, null_bits);
 
     // type (UpdateType)
@@ -62,14 +62,14 @@ pub fn serialize(
     try buf.append(allocator, 1); // updateMapGeometry
 
     // blockTypes dictionary (if present)
-    if (entries.len > 0) {
+    if (entries) |ents| {
         // VarInt count
         var vi_buf: [5]u8 = undefined;
-        const vi_len = serializer.writeVarInt(&vi_buf, @intCast(entries.len));
+        const vi_len = serializer.writeVarInt(&vi_buf, @intCast(ents.len));
         try buf.appendSlice(allocator, vi_buf[0..vi_len]);
 
         // Each entry: i32 key + BlockType data
-        for (entries) |entry| {
+        for (ents) |entry| {
             // Key (i32 LE)
             var key_bytes: [4]u8 = undefined;
             std.mem.writeInt(i32, &key_bytes, @intCast(entry.id), .little);
@@ -85,17 +85,11 @@ pub fn serialize(
     return buf.toOwnedSlice(allocator);
 }
 
-/// Build empty packet (11 bytes)
-/// FIXED=10: nullBits(1) + type(1) + maxId(4) + 4 bools(4) + VarInt(1) = 11 bytes
-pub fn buildEmptyPacket(allocator: std.mem.Allocator) ![]u8 {
-    return serializer.serializeEmptyUpdate(allocator, .init, 0, &[_]u8{ 0, 0, 0, 0 });
-}
-
 test "UpdateBlockTypes empty packet size" {
     const allocator = std.testing.allocator;
-    const pkt = try buildEmptyPacket(allocator);
+    const pkt = try serialize(allocator, .init, 0, null);
     defer allocator.free(pkt);
-    try std.testing.expectEqual(@as(usize, 11), pkt.len);
+    try std.testing.expectEqual(@as(usize, 10), pkt.len);
 }
 
 test "UpdateBlockTypes with entries" {
@@ -235,4 +229,158 @@ test "UpdateBlockTypes solid block (no air) has correct bytes" {
 
     // Verify opacity = solid (0) at offset 22
     try std.testing.expectEqual(@as(u8, 0), pkt[22]); // opacity = solid
+}
+
+test "UpdateBlockTypes registry simulation (5 blocks including air)" {
+    const allocator = std.testing.allocator;
+
+    // Simulate exactly what generateBlockTypesPacket does in registry.zig
+    var block1 = try BlockTypeAsset.solid(allocator, "Bedrock");
+    defer if (block1.cube_textures) |*tex| tex.deinit(allocator);
+    var block2 = try BlockTypeAsset.solid(allocator, "Stone");
+    defer if (block2.cube_textures) |*tex| tex.deinit(allocator);
+    var block3 = try BlockTypeAsset.solid(allocator, "Dirt");
+    defer if (block3.cube_textures) |*tex| tex.deinit(allocator);
+    var block4 = try BlockTypeAsset.solid(allocator, "Grass");
+    defer if (block4.cube_textures) |*tex| tex.deinit(allocator);
+
+    const entries = [_]BlockTypeEntry{
+        .{ .id = 0, .block_type = BlockTypeAsset.air() },
+        .{ .id = 1, .block_type = block1 },
+        .{ .id = 2, .block_type = block2 },
+        .{ .id = 3, .block_type = block3 },
+        .{ .id = 4, .block_type = block4 },
+    };
+
+    const pkt = try serialize(allocator, .init, 4, &entries);
+    defer allocator.free(pkt);
+
+    // Packet header verification
+    try std.testing.expectEqual(@as(u8, 0x01), pkt[0]); // nullBits: dict present
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[1]); // type = init
+    try std.testing.expectEqual(@as(i32, 4), std.mem.readInt(i32, pkt[2..6], .little)); // maxId = 4
+    try std.testing.expectEqual(@as(u8, 1), pkt[6]); // updateBlockTextures
+    try std.testing.expectEqual(@as(u8, 1), pkt[7]); // updateModelTextures
+    try std.testing.expectEqual(@as(u8, 1), pkt[8]); // updateModels
+    try std.testing.expectEqual(@as(u8, 1), pkt[9]); // updateMapGeometry
+    try std.testing.expectEqual(@as(u8, 5), pkt[10]); // VarInt count = 5
+
+    // First entry: Block 0 (air)
+    // [11-14]: key = 0
+    // [15-18]: nullBits = 0x00 0x00 0x00 0x00 (no fields)
+    // [19]: unknown = 0
+    // [20]: draw_type = 0 (empty)
+    try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[11..15], .little)); // block ID 0
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[15]); // nullBits[0]
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[16]); // nullBits[1] - NO name flag!
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[17]); // nullBits[2]
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[18]); // nullBits[3]
+    try std.testing.expectEqual(@as(u8, 0), pkt[19]); // unknown = false
+    try std.testing.expectEqual(@as(u8, 0), pkt[20]); // draw_type = empty (0)
+    try std.testing.expectEqual(@as(u8, 0), pkt[21]); // material = empty (0)
+    try std.testing.expectEqual(@as(u8, 0), pkt[22]); // opacity = solid (0)
+
+    // Verify the CRITICAL condition is met for air block:
+    // If draw_type == empty (0), then nullBits[1] bit 0 MUST be 0 (no name)
+    const air_draw_type = pkt[20];
+    const air_has_name = (pkt[16] & 0x01) != 0;
+    if (air_draw_type == 0 and air_has_name) {
+        // This would cause "Block type with EmptyBlockId but has name" error
+        return error.InvalidAirBlockHasName;
+    }
+
+    // Verify entry boundaries:
+    // Entry 0 (air): key at 11-14, BlockType data at 15-273 (259 bytes)
+    // Entry 1 (bedrock): key at 274-277, BlockType data at 278+
+    const air_block_data_start = 15; // After packet header and entry 0 key
+    const air_block_data_size = 259; // Air block with no variable fields
+    const entry1_key_pos = air_block_data_start + air_block_data_size;
+
+    // Verify entry 1 key (Bedrock, id = 1)
+    try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, pkt[entry1_key_pos..][0..4], .little));
+
+    // Verify entry 1 BlockType data (Bedrock)
+    const entry1_data_start = entry1_key_pos + 4;
+    const entry1_nullbits = pkt[entry1_data_start .. entry1_data_start + 4];
+    // nullBits[0] = 0x00 (no item)
+    // nullBits[1] = 0x81 (name present bit 0 + cubeTextures present bit 7)
+    try std.testing.expectEqual(@as(u8, 0x00), entry1_nullbits[0]);
+    try std.testing.expectEqual(@as(u8, 0x81), entry1_nullbits[1]);
+    // Verify draw_type = cube (2) for Bedrock
+    try std.testing.expectEqual(@as(u8, 2), pkt[entry1_data_start + 5]); // draw_type at offset 5 from BlockType start
+}
+
+test "UpdateBlockTypes all entries validated for EmptyBlockId+name constraint" {
+    const allocator = std.testing.allocator;
+
+    // Simulate the exact packet we send to the client
+    var block1 = try BlockTypeAsset.solid(allocator, "Bedrock");
+    defer if (block1.cube_textures) |*tex| tex.deinit(allocator);
+    var block2 = try BlockTypeAsset.solid(allocator, "Stone");
+    defer if (block2.cube_textures) |*tex| tex.deinit(allocator);
+    var block3 = try BlockTypeAsset.solid(allocator, "Dirt");
+    defer if (block3.cube_textures) |*tex| tex.deinit(allocator);
+    var block4 = try BlockTypeAsset.solid(allocator, "Grass");
+    defer if (block4.cube_textures) |*tex| tex.deinit(allocator);
+
+    const entries_data = [_]BlockTypeEntry{
+        .{ .id = 0, .block_type = BlockTypeAsset.air() },
+        .{ .id = 1, .block_type = block1 },
+        .{ .id = 2, .block_type = block2 },
+        .{ .id = 3, .block_type = block3 },
+        .{ .id = 4, .block_type = block4 },
+    };
+
+    const pkt = try serialize(allocator, .init, 4, &entries_data);
+    defer allocator.free(pkt);
+
+    // Calculate sizes of each serialized block
+    var block_sizes: [5]usize = undefined;
+    for (0..5) |i| {
+        const block_data = try entries_data[i].block_type.serialize(allocator);
+        block_sizes[i] = block_data.len;
+        allocator.free(block_data);
+    }
+
+    // Packet header: 11 bytes
+    // Entry format: 4 bytes key + BlockType data
+    var pos: usize = 11; // After header
+
+    for (0..5) |entry_idx| {
+        // Read block ID (4 bytes)
+        const block_id = std.mem.readInt(i32, pkt[pos..][0..4], .little);
+        try std.testing.expectEqual(@as(i32, @intCast(entry_idx)), block_id);
+        pos += 4;
+
+        // Read BlockType nullBits (4 bytes)
+        const null_bits = pkt[pos .. pos + 4];
+        pos += 4;
+
+        // Read draw_type (byte 5 from BlockType start = position 4 + 1)
+        // Skip unknown byte (byte 0 after nullBits)
+        pos += 1;
+
+        const actual_draw_type = pkt[pos]; // draw_type (byte 1 after nullBits)
+        pos += 1;
+
+        // Check constraint: if draw_type == 0 (Empty), name bit must be 0
+        const has_name = (null_bits[1] & 0x01) != 0;
+        if (actual_draw_type == 0) {
+            // This is an empty block (like air) - must NOT have name
+            try std.testing.expect(!has_name);
+        } else {
+            // Non-empty block (like Bedrock) - CAN have name
+            // For our solid blocks, they SHOULD have names
+            if (entry_idx > 0) {
+                try std.testing.expect(has_name);
+            }
+        }
+
+        // Skip to next entry (remaining block data)
+        const remaining = block_sizes[entry_idx] - 6; // Already read 4 nullBits + 2 (unknown + draw_type)
+        pos += remaining;
+    }
+
+    // Verify we consumed the entire packet
+    try std.testing.expectEqual(pkt.len, pos);
 }

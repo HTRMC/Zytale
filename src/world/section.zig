@@ -213,22 +213,21 @@ pub const Section = struct {
     }
 
     /// Create an empty (all air) section for serialization
+    /// Format from BlockSection.serializeForPacket with EmptySectionPalette:
+    /// Empty palettes write nothing after the type byte, so just 3 bytes total
     pub fn serializeEmpty(allocator: std.mem.Allocator) ![]u8 {
-        // Empty section: 3 bytes (one for each palette type = empty)
-        // Plus minimal palette data (1 varint = 0 for each)
-        const buf = try allocator.alloc(u8, 6);
+        // Empty section: just 3 bytes (one palette type byte for each palette)
+        // EmptySectionPalette.serializeForPacket() writes nothing
+        const buf = try allocator.alloc(u8, 3);
 
-        // Block palette: empty type + 0 entries
+        // Block palette: empty type (no additional data for empty palette)
         buf[0] = @intFromEnum(PaletteType.empty);
-        buf[1] = 0; // 0 entries
 
-        // Filler palette: empty type + 0 entries
+        // Filler palette: empty type
+        buf[1] = @intFromEnum(PaletteType.empty);
+
+        // Rotation palette: empty type
         buf[2] = @intFromEnum(PaletteType.empty);
-        buf[3] = 0;
-
-        // Rotation palette: empty type + 0 entries
-        buf[4] = @intFromEnum(PaletteType.empty);
-        buf[5] = 0;
 
         return buf;
     }
@@ -291,4 +290,55 @@ test "section serialization" {
     // First byte should be palette type
     const block_type: PaletteType = @enumFromInt(data[0]);
     try std.testing.expect(block_type != .empty); // Not empty since we filled it
+}
+
+test "section empty serialization format" {
+    const allocator = std.testing.allocator;
+
+    const data = try Section.serializeEmpty(allocator);
+    defer allocator.free(data);
+
+    // Empty section should be exactly 3 bytes (one type byte per palette)
+    try std.testing.expectEqual(@as(usize, 3), data.len);
+
+    // All three palette types should be empty (0)
+    try std.testing.expectEqual(@as(u8, 0), data[0]); // block palette type = empty
+    try std.testing.expectEqual(@as(u8, 0), data[1]); // filler palette type = empty
+    try std.testing.expectEqual(@as(u8, 0), data[2]); // rotation palette type = empty
+}
+
+test "section non-empty serialization format" {
+    const allocator = std.testing.allocator;
+
+    var section = Section.init(allocator);
+    defer section.deinit();
+
+    // Add one stone block - this creates a minimal non-empty palette
+    try section.setBlock(0, 0, 0, constants.BlockId.STONE);
+
+    // Serialize
+    const data = try section.serialize(allocator);
+    defer allocator.free(data);
+
+    // First byte: block palette type (should be half_byte = 1 for 2 unique blocks: air + stone)
+    const block_palette_type: PaletteType = @enumFromInt(data[0]);
+    try std.testing.expectEqual(PaletteType.half_byte, block_palette_type);
+
+    // After palette type: palette data in Java format
+    // [2 bytes LE] count
+    // For each entry: [1 byte internal] [4 bytes external] [2 bytes count]
+    const palette_count = std.mem.readInt(u16, data[1..3], .little);
+    try std.testing.expectEqual(@as(u16, 2), palette_count); // air + stone
+
+    // First entry should be air (block ID 0)
+    const entry1_internal = data[3];
+    const entry1_external = std.mem.readInt(u32, data[4..8], .little);
+    try std.testing.expectEqual(@as(u8, 0), entry1_internal);
+    try std.testing.expectEqual(@as(u32, 0), entry1_external); // AIR = 0
+
+    // Second entry should be stone (block ID 2)
+    const entry2_internal = data[10];
+    const entry2_external = std.mem.readInt(u32, data[11..15], .little);
+    try std.testing.expectEqual(@as(u8, 1), entry2_internal);
+    try std.testing.expectEqual(@as(u32, 2), entry2_external); // STONE = 2
 }

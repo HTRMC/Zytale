@@ -733,6 +733,25 @@ pub const AssetRegistry = struct {
             entries.len,
             payload.len,
         });
+
+        // Debug hex dump of first block type (air block at offset 11 = 10 header + 1 varint)
+        // Packet structure: [0]=nullBits, [1]=type, [2-5]=maxId, [6-9]=4 bools, [10]=count, [11-14]=key0, [15+]=BlockType0
+        if (payload.len >= 25) {
+            log.info("UpdateBlockTypes hex dump (first 25 bytes):", .{});
+            log.info("  Header: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
+                payload[0], payload[1], payload[2], payload[3], payload[4],
+                payload[5], payload[6], payload[7], payload[8], payload[9],
+            });
+            log.info("  Count+Key0: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
+                payload[10], payload[11], payload[12], payload[13], payload[14],
+            });
+            log.info("  Block0 nullBits: {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
+                payload[15], payload[16], payload[17], payload[18],
+            });
+            log.info("  Block0 fields: unknown={x:0>2} drawType={x:0>2} material={x:0>2} opacity={x:0>2}", .{
+                payload[19], payload[20], payload[21], payload[22],
+            });
+        }
     }
 
     /// Generate empty packets for all required asset types not yet implemented

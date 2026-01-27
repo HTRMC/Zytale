@@ -113,17 +113,40 @@ pub const BlockPalette = struct {
         self.palette_type = .empty;
     }
 
-    /// Serialize palette for network transmission
-    /// Format: [VarInt count] [VarInt block_id]...
+    /// Serialize palette for network transmission (serializeForPacket format)
+    /// Format from AbstractByteSectionPalette.serializeForPacket:
+    /// [2 bytes LE] palette entry count
+    /// For each entry:
+    ///   [1 byte] internal ID (palette index)
+    ///   [4 bytes LE] external block ID
+    ///   [2 bytes LE] count of this block (we use 0 since we don't track counts)
+    /// Note: For empty palette, nothing is written (handled by EmptySectionPalette)
     pub fn serialize(self: *const Self, buf: []u8) !usize {
+        // Empty palette writes nothing
+        if (self.palette_type == .empty or self.entries.items.len == 0) {
+            return 0;
+        }
+
         var offset: usize = 0;
 
-        // Write entry count
-        offset += varint.writeVarInt(@intCast(self.entries.items.len), buf[offset..]);
+        // Write entry count (2 bytes LE)
+        const count: u16 = @intCast(self.entries.items.len);
+        std.mem.writeInt(u16, buf[offset..][0..2], count, .little);
+        offset += 2;
 
-        // Write each block ID
-        for (self.entries.items) |block_id| {
-            offset += varint.writeVarInt(@as(u32, block_id), buf[offset..]);
+        // Write each palette entry
+        for (self.entries.items, 0..) |block_id, idx| {
+            // Internal ID (1 byte)
+            buf[offset] = @intCast(idx);
+            offset += 1;
+
+            // External block ID (4 bytes LE)
+            std.mem.writeInt(u32, buf[offset..][0..4], @as(u32, block_id), .little);
+            offset += 4;
+
+            // Block count (2 bytes LE) - we don't track this, use 0
+            std.mem.writeInt(u16, buf[offset..][0..2], 0, .little);
+            offset += 2;
         }
 
         return offset;
@@ -131,11 +154,12 @@ pub const BlockPalette = struct {
 
     /// Calculate serialized size
     pub fn serializedSize(self: *const Self) usize {
-        var size = varint.varIntSize(@intCast(self.entries.items.len));
-        for (self.entries.items) |block_id| {
-            size += varint.varIntSize(@as(u32, block_id));
+        // Empty palette writes nothing
+        if (self.palette_type == .empty or self.entries.items.len == 0) {
+            return 0;
         }
-        return size;
+        // 2 bytes for count + 7 bytes per entry (1 internal + 4 external + 2 count)
+        return 2 + (self.entries.items.len * 7);
     }
 };
 
