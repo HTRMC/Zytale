@@ -690,3 +690,54 @@ test "DrawType enum values match Java protocol" {
     try std.testing.expectEqual(@as(u8, 3), @intFromEnum(DrawType.model));
     try std.testing.expectEqual(@as(u8, 4), @intFromEnum(DrawType.cube_with_model));
 }
+
+test "BlockTypeAsset fixed block size matches Java protocol" {
+    const allocator = std.testing.allocator;
+
+    const air_block = BlockTypeAsset.air();
+    const data = try air_block.serialize(allocator);
+    defer allocator.free(data);
+
+    // Minimum size: 4 (nullBits) + 159 (fixed) + 96 (offsets) = 259
+    try std.testing.expectEqual(@as(usize, 259), data.len);
+
+    // Verify position 163 is where offset slots start
+    // For air block with no variable fields, all 24 slots should be -1
+    // Slot 0 at offset 163
+    const slot0 = std.mem.readInt(i32, data[163..167], .little);
+    try std.testing.expectEqual(@as(i32, -1), slot0);
+
+    // Slot 1 (name) at offset 167
+    const slot1 = std.mem.readInt(i32, data[167..171], .little);
+    try std.testing.expectEqual(@as(i32, -1), slot1);
+
+    // Slot 8 (cubeTextures) at offset 195
+    const slot8 = std.mem.readInt(i32, data[195..199], .little);
+    try std.testing.expectEqual(@as(i32, -1), slot8);
+}
+
+test "BlockTypeAsset solid block offset slots" {
+    const allocator = std.testing.allocator;
+
+    var stone = try BlockTypeAsset.solid(allocator, "Stone");
+    defer if (stone.cube_textures) |*tex| tex.deinit(allocator);
+    const data = try stone.serialize(allocator);
+    defer allocator.free(data);
+
+    // Slot 0 (item) at offset 163: should be -1 (no item)
+    const slot0 = std.mem.readInt(i32, data[163..167], .little);
+    try std.testing.expectEqual(@as(i32, -1), slot0);
+
+    // Slot 1 (name) at offset 167: should be 0 (first variable field)
+    const slot1 = std.mem.readInt(i32, data[167..171], .little);
+    try std.testing.expectEqual(@as(i32, 0), slot1);
+
+    // Slot 8 (cubeTextures) at offset 195: should be > 0 (after name)
+    const slot8 = std.mem.readInt(i32, data[195..199], .little);
+    try std.testing.expect(slot8 > 0);
+
+    // Verify name is at variable block start (offset 259)
+    // VarInt length of "Stone" (5) followed by "Stone"
+    try std.testing.expectEqual(@as(u8, 5), data[259]); // VarInt length
+    try std.testing.expectEqualStrings("Stone", data[260..265]);
+}

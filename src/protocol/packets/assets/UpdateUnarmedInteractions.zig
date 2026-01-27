@@ -32,28 +32,28 @@ pub const UnarmedInteractionEntry = struct {
 pub fn serialize(
     allocator: std.mem.Allocator,
     update_type: serializer.UpdateType,
-    entries: []const UnarmedInteractionEntry,
+    entries: ?[]const UnarmedInteractionEntry,
 ) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8){};
     errdefer buf.deinit(allocator);
 
     // nullBits
     var null_bits: u8 = 0;
-    if (entries.len > 0) null_bits |= 0x01;
+    if (entries != null) null_bits |= 0x01;
     try buf.append(allocator, null_bits);
 
     // type (UpdateType)
     try buf.append(allocator, @intFromEnum(update_type));
 
     // interactions (if present)
-    if (entries.len > 0) {
+    if (entries) |ents| {
         // VarInt count
         var vi_buf: [5]u8 = undefined;
-        const vi_len = serializer.writeVarInt(&vi_buf, @intCast(entries.len));
+        const vi_len = serializer.writeVarInt(&vi_buf, @intCast(ents.len));
         try buf.appendSlice(allocator, vi_buf[0..vi_len]);
 
         // Each entry: InteractionType (1 byte) + i32 value (4 bytes)
-        for (entries) |entry| {
+        for (ents) |entry| {
             try buf.append(allocator, @intFromEnum(entry.interaction_type));
             var val_bytes: [4]u8 = undefined;
             std.mem.writeInt(i32, &val_bytes, entry.value, .little);
@@ -64,20 +64,11 @@ pub fn serialize(
     return buf.toOwnedSlice(allocator);
 }
 
-/// Build empty packet (3 bytes)
-pub fn buildEmptyPacket(allocator: std.mem.Allocator) ![]u8 {
-    const buf = try allocator.alloc(u8, 3);
-    buf[0] = 0x01; // nullBits: interactions present (empty dict)
-    buf[1] = 0x00; // type = Init
-    buf[2] = 0x00; // VarInt count = 0
-    return buf;
-}
-
 test "UpdateUnarmedInteractions empty packet size" {
     const allocator = std.testing.allocator;
-    const pkt = try buildEmptyPacket(allocator);
+    const pkt = try serialize(allocator, .init, null);
     defer allocator.free(pkt);
-    try std.testing.expectEqual(@as(usize, 3), pkt.len);
+    try std.testing.expectEqual(@as(usize, 2), pkt.len);
 }
 
 test "UpdateUnarmedInteractions with entries" {

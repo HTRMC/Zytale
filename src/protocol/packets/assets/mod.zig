@@ -21,7 +21,7 @@ pub const UpdateEnvironments = @import("UpdateEnvironments.zig");
 pub const UpdateBlockTypes = @import("UpdateBlockTypes.zig");
 
 // ============================================================================
-// Placeholder packets (buildEmptyPacket only)
+// Packets with custom serialize (no buildEmptyPacket)
 // ============================================================================
 pub const UpdateBlockHitboxes = @import("UpdateBlockHitboxes.zig");
 pub const UpdateBlockSoundSets = @import("UpdateBlockSoundSets.zig");
@@ -72,52 +72,64 @@ pub const UpdateType = serializer.UpdateType;
 
 /// Build an empty Update* packet for a given asset type
 /// Packet IDs match protocol registry (asset packets: 40-85)
+/// Note: Java packet generators always create empty collections (not null),
+/// so we pass empty slices (&.{}) to set nullBits=1 with count=0.
 pub fn buildEmptyPacket(allocator: std.mem.Allocator, packet_id: u32) ![]u8 {
     return switch (packet_id) {
-        40 => UpdateBlockTypes.buildEmptyPacket(allocator),
-        41 => UpdateBlockHitboxes.buildEmptyPacket(allocator),
-        42 => UpdateBlockSoundSets.buildEmptyPacket(allocator),
-        43 => UpdateItemSoundSets.buildEmptyPacket(allocator),
-        44 => UpdateBlockParticleSets.buildEmptyPacket(allocator),
-        45 => UpdateBlockBreakingDecals.buildEmptyPacket(allocator),
-        46 => UpdateBlockSets.buildEmptyPacket(allocator),
-        47 => UpdateWeathers.buildEmptyPacket(allocator),
+        // Packets with max_id parameter (int-keyed dictionaries)
+        40 => UpdateBlockTypes.serialize(allocator, .init, 0, &.{}),
+        41 => UpdateBlockHitboxes.serialize(allocator, .init, 0, &.{}),
+        42 => UpdateBlockSoundSets.serialize(allocator, .init, 0, &.{}),
+        43 => UpdateItemSoundSets.serialize(allocator, .init, 0, &.{}),
+        47 => UpdateWeathers.serialize(allocator, .init, 0, &.{}),
+        53 => UpdateModelvfxs.serialize(allocator, .init, 0, &.{}),
+        55 => UpdateItemQualities.serialize(allocator, .init, 0, &.{}),
+        57 => UpdateItemReticles.serialize(allocator, .init, 0, &.{}),
+        62 => UpdateAmbienceFX.serialize(allocator, .init, 0, &.{}),
+        63 => UpdateFluidFX.serialize(allocator, .init, 0, &.{}),
+        65 => UpdateSoundEvents.serialize(allocator, .init, 0, &.{}),
+        66 => UpdateInteractions.serialize(allocator, .init, 0, &.{}),
+        67 => UpdateRootInteractions.serialize(allocator, .init, 0, &.{}),
+        72 => UpdateEntityStatTypes.serialize(allocator, .init, 0, &.{}),
+        73 => UpdateEntityUIComponents.serialize(allocator, .init, 0, &.{}),
+        74 => UpdateHitboxCollisionConfig.serialize(allocator, .init, 0, &.{}),
+        75 => UpdateRepulsionConfig.serialize(allocator, .init, 0, &.{}),
+        79 => UpdateSoundSets.serialize(allocator, .init, 0, &.{}),
+        83 => UpdateFluids.serialize(allocator, .init, 0, &.{}),
+
+        // Packets without max_id (string-keyed dictionaries)
+        44 => UpdateBlockParticleSets.serialize(allocator, .init, &.{}),
+        45 => UpdateBlockBreakingDecals.serialize(allocator, .init, &.{}),
+        46 => UpdateBlockSets.serialize(allocator, .init, &.{}),
+        52 => UpdateItemPlayerAnimations.serialize(allocator, .init, &.{}),
+        59 => UpdateResourceTypes.serialize(allocator, .init, &.{}),
+        64 => UpdateTranslations.serialize(allocator, .init, &.{}),
+        68 => UpdateUnarmedInteractions.serialize(allocator, .init, &.{}),
+        78 => UpdateBlockGroups.serialize(allocator, .init, &.{}),
+
+        // Packets with offset-based variable fields
+        // For init packets: main dictionary = empty slice, removed array = null
+        // This matches Java: empty HashMap for data, null for removed field
+        49 => UpdateParticleSystems.serialize(allocator, .init, &.{}, null),
+        50 => UpdateParticleSpawners.serialize(allocator, .init, &.{}, null),
+        54 => UpdateItems.serialize(allocator, .init, false, false, &.{}, null),
+        60 => UpdateRecipes.serialize(allocator, .init, &.{}, null),
+        85 => UpdateProjectileConfigs.serialize(allocator, .init, &.{}, null),
+
+        // Packets using generic serializers (keep buildEmptyPacket)
         48 => UpdateTrails.buildEmptyPacket(allocator),
-        49 => UpdateParticleSystems.buildEmptyPacket(allocator),
-        50 => UpdateParticleSpawners.buildEmptyPacket(allocator),
         51 => UpdateEntityEffects.buildEmptyPacket(allocator),
-        52 => UpdateItemPlayerAnimations.buildEmptyPacket(allocator),
-        53 => UpdateModelvfxs.buildEmptyPacket(allocator),
-        54 => UpdateItems.buildEmptyPacket(allocator),
-        55 => UpdateItemQualities.buildEmptyPacket(allocator),
         56 => UpdateItemCategories.buildEmptyPacket(allocator),
-        57 => UpdateItemReticles.buildEmptyPacket(allocator),
         58 => UpdateFieldcraftCategories.buildEmptyPacket(allocator),
-        59 => UpdateResourceTypes.buildEmptyPacket(allocator),
-        60 => UpdateRecipes.buildEmptyPacket(allocator),
         61 => UpdateEnvironments.buildEmptyPacket(allocator),
-        62 => UpdateAmbienceFX.buildEmptyPacket(allocator),
-        63 => UpdateFluidFX.buildEmptyPacket(allocator),
-        64 => UpdateTranslations.buildEmptyPacket(allocator),
-        65 => UpdateSoundEvents.buildEmptyPacket(allocator),
-        66 => UpdateInteractions.buildEmptyPacket(allocator),
-        67 => UpdateRootInteractions.buildEmptyPacket(allocator),
-        68 => UpdateUnarmedInteractions.buildEmptyPacket(allocator),
-        // 69-71 are objective tracking packets, not asset packets
-        72 => UpdateEntityStatTypes.buildEmptyPacket(allocator),
-        73 => UpdateEntityUIComponents.buildEmptyPacket(allocator),
-        74 => UpdateHitboxCollisionConfig.buildEmptyPacket(allocator),
-        75 => UpdateRepulsionConfig.buildEmptyPacket(allocator),
         76 => UpdateViewBobbing.buildEmptyPacket(allocator),
         77 => UpdateCameraShake.buildEmptyPacket(allocator),
-        78 => UpdateBlockGroups.buildEmptyPacket(allocator),
-        79 => UpdateSoundSets.buildEmptyPacket(allocator),
         80 => UpdateAudioCategories.buildEmptyPacket(allocator),
         81 => UpdateReverbEffects.buildEmptyPacket(allocator),
         82 => UpdateEqualizerEffects.buildEmptyPacket(allocator),
-        83 => UpdateFluids.buildEmptyPacket(allocator),
         84 => UpdateTagPatterns.buildEmptyPacket(allocator),
-        85 => UpdateProjectileConfigs.buildEmptyPacket(allocator),
+
+        // 69-71 are objective tracking packets, not asset packets
         else => error.UnknownPacketId,
     };
 }
@@ -182,11 +194,13 @@ test "buildEmptyPacket for common types" {
     defer allocator.free(audio_pkt);
     try std.testing.expectEqual(@as(usize, 7), audio_pkt.len);
 
-    // Trails is packet ID 48 (not 51)
+    // Trails is packet ID 48 (uses generic serializer)
     const trails_pkt = try buildEmptyPacket(allocator, 48);
     defer allocator.free(trails_pkt);
     try std.testing.expectEqual(@as(usize, 3), trails_pkt.len);
 
+    // BlockTypes uses serialize with empty slice (nullBits=1, count=0)
+    // Size: 10 bytes fixed + 1 byte VarInt(0) = 11 bytes
     const blocks_pkt = try buildEmptyPacket(allocator, 40);
     defer allocator.free(blocks_pkt);
     try std.testing.expectEqual(@as(usize, 11), blocks_pkt.len);

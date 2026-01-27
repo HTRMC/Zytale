@@ -7,6 +7,7 @@ const Stream = @import("stream.zig").Stream;
 const registry = @import("protocol");
 const auth = @import("../auth/auth.zig");
 const assets = @import("../assets/mod.zig");
+const World = @import("../world/world.zig").World;
 
 const log = std.log.scoped(.server);
 
@@ -64,6 +65,9 @@ pub const Server = struct {
     // Asset registry for loading game assets
     asset_registry: assets.AssetRegistry,
 
+    // World for players to join
+    world: ?*World,
+
     const Self = @This();
 
     pub fn init(allocator: std.mem.Allocator, config: ServerConfig, credentials: *auth.ServerCredentials) !Self {
@@ -83,6 +87,7 @@ pub const Server = struct {
             .session_client = auth.SessionServiceClient.init(allocator),
             .server_credentials = credentials,
             .asset_registry = assets.AssetRegistry.init(allocator),
+            .world = null,
         };
     }
 
@@ -124,6 +129,12 @@ pub const Server = struct {
 
         // Clean up asset registry
         self.asset_registry.deinit();
+
+        // Clean up world
+        if (self.world) |world| {
+            world.deinit();
+            self.allocator.destroy(world);
+        }
     }
 
     /// Initialize MsQuic and configure the server
@@ -200,6 +211,20 @@ pub const Server = struct {
             };
         };
         log.info("Loaded {d} assets", .{self.asset_registry.count()});
+
+        // Create default world
+        log.info("Creating default world...", .{});
+        const world = self.allocator.create(World) catch |err| {
+            log.err("Failed to create world: {}", .{err});
+            return error.WorldCreationFailed;
+        };
+        world.* = World.init(self.allocator, "Default World") catch |err| {
+            self.allocator.destroy(world);
+            log.err("Failed to initialize world: {}", .{err});
+            return error.WorldCreationFailed;
+        };
+        self.world = world;
+        log.info("Created world with UUID", .{});
 
         log.info("Server setup complete", .{});
     }

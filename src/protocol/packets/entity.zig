@@ -110,7 +110,7 @@ pub const EntityData = struct {
 ///   [entity data] varies by type
 pub const EntityUpdates = struct {
     allocator: std.mem.Allocator,
-    updates: std.ArrayList(EntityUpdate),
+    updates: std.ArrayListUnmanaged(EntityUpdate),
 
     pub const EntityUpdate = struct {
         update_type: EntityUpdateType,
@@ -123,17 +123,17 @@ pub const EntityUpdates = struct {
     pub fn init(allocator: std.mem.Allocator) Self {
         return .{
             .allocator = allocator,
-            .updates = std.ArrayList(EntityUpdate).init(allocator),
+            .updates = .empty,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.updates.deinit();
+        self.updates.deinit(self.allocator);
     }
 
     /// Add a new entity
     pub fn addEntity(self: *Self, data: EntityData) !void {
-        try self.updates.append(.{
+        try self.updates.append(self.allocator, .{
             .update_type = .add,
             .entity_id = data.entity_id,
             .data = data,
@@ -142,7 +142,7 @@ pub const EntityUpdates = struct {
 
     /// Update an existing entity
     pub fn updateEntity(self: *Self, data: EntityData) !void {
-        try self.updates.append(.{
+        try self.updates.append(self.allocator, .{
             .update_type = .update,
             .entity_id = data.entity_id,
             .data = data,
@@ -151,7 +151,7 @@ pub const EntityUpdates = struct {
 
     /// Remove an entity
     pub fn removeEntity(self: *Self, entity_id: u32) !void {
-        try self.updates.append(.{
+        try self.updates.append(self.allocator, .{
             .update_type = .remove,
             .entity_id = entity_id,
             .data = null,

@@ -80,35 +80,10 @@ pub const JoinSequence = struct {
     }
 
     /// Send initial setup packets
+    /// Note: ConnectAccept is already sent during the setup phase in stream.zig
     fn sendInitialPackets(self: *Self) !void {
-        // ConnectAccept (ID=14)
-        {
-            const packet = player_packets.ConnectAccept.success();
-            const data = try packet.serialize(self.allocator);
-            defer self.allocator.free(data);
-            try self.connection.sendPacket(registry.ConnectAccept.id, data);
-            log.debug("Sent ConnectAccept", .{});
-        }
-
-        // SetClientId (ID=100)
-        {
-            const packet = player_packets.SetClientId{ .client_id = self.connection.client_id };
-            const data = try packet.serialize(self.allocator);
-            defer self.allocator.free(data);
-            try self.connection.sendPacket(registry.SetClientId.id, data);
-            log.debug("Sent SetClientId: {d}", .{self.connection.client_id});
-        }
-
-        // ViewRadius (ID=32)
-        {
-            const packet = player_packets.ViewRadius{ .radius = self.view_radius };
-            const data = try packet.serialize(self.allocator);
-            defer self.allocator.free(data);
-            try self.connection.sendPacket(registry.ViewRadius.id, data);
-            log.debug("Sent ViewRadius: {d}", .{self.view_radius});
-        }
-
-        // JoinWorld (ID=104)
+        // JoinWorld (ID=104) - Signal client to enter world
+        // This is sent AFTER PlayerOptions is received
         {
             const packet = world_packets.JoinWorld{
                 .clear_world = true,
@@ -121,6 +96,37 @@ pub const JoinSequence = struct {
             log.debug("Sent JoinWorld", .{});
         }
 
+        // ViewRadius (ID=32) - chunk loading distance in blocks (radius * 32)
+        {
+            const packet = player_packets.ViewRadius{ .radius = self.view_radius * 32 };
+            const data = try packet.serialize(self.allocator);
+            defer self.allocator.free(data);
+            try self.connection.sendPacket(registry.ViewRadius.id, data);
+            log.debug("Sent ViewRadius: {d} blocks", .{self.view_radius * 32});
+        }
+
+        // SetEntitySeed (ID=160) - for client-side entity ID generation
+        {
+            var seed_bytes: [4]u8 = undefined;
+            const io = std.Io.Threaded.global_single_threaded.io();
+            io.random(&seed_bytes);
+            const seed = std.mem.readInt(u32, &seed_bytes, .little);
+            const packet = player_packets.SetEntitySeed{ .seed = seed };
+            const data = try packet.serialize(self.allocator);
+            defer self.allocator.free(data);
+            try self.connection.sendPacket(registry.SetEntitySeed.id, data);
+            log.debug("Sent SetEntitySeed: {d}", .{seed});
+        }
+
+        // SetClientId (ID=100) - assign network entity ID
+        {
+            const packet = player_packets.SetClientId{ .client_id = self.connection.client_id };
+            const data = try packet.serialize(self.allocator);
+            defer self.allocator.free(data);
+            try self.connection.sendPacket(registry.SetClientId.id, data);
+            log.debug("Sent SetClientId: {d}", .{self.connection.client_id});
+        }
+
         // SetGameMode (ID=101) - Creative mode
         {
             const packet = player_packets.SetGameMode{ .mode = .creative };
@@ -128,17 +134,6 @@ pub const JoinSequence = struct {
             defer self.allocator.free(data);
             try self.connection.sendPacket(registry.SetGameMode.id, data);
             log.debug("Sent SetGameMode: creative", .{});
-        }
-
-        // SetEntitySeed (ID=160)
-        {
-            var rng = std.Random.DefaultPrng.init(@bitCast(std.time.timestamp()));
-            const seed = rng.random().int(u32);
-            const packet = player_packets.SetEntitySeed{ .seed = seed };
-            const data = try packet.serialize(self.allocator);
-            defer self.allocator.free(data);
-            try self.connection.sendPacket(registry.SetEntitySeed.id, data);
-            log.debug("Sent SetEntitySeed: {d}", .{seed});
         }
     }
 

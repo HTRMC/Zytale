@@ -33,27 +33,27 @@ pub const BlockParticleSetEntry = struct {
 pub fn serialize(
     allocator: std.mem.Allocator,
     update_type: serializer.UpdateType,
-    entries: []const BlockParticleSetEntry,
+    entries: ?[]const BlockParticleSetEntry,
 ) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8){};
     errdefer buf.deinit(allocator);
 
     // nullBits: bit 0 = blockParticleSets present
-    const null_bits: u8 = if (entries.len > 0) 0x01 else 0x00;
+    const null_bits: u8 = if (entries != null) 0x01 else 0x00;
     try buf.append(allocator, null_bits);
 
     // type (UpdateType)
     try buf.append(allocator, @intFromEnum(update_type));
 
     // blockParticleSets dictionary (if present)
-    if (entries.len > 0) {
+    if (entries) |ents| {
         // VarInt count
         var vi_buf: [5]u8 = undefined;
-        const vi_len = serializer.writeVarInt(&vi_buf, @intCast(entries.len));
+        const vi_len = serializer.writeVarInt(&vi_buf, @intCast(ents.len));
         try buf.appendSlice(allocator, vi_buf[0..vi_len]);
 
         // Each entry: VarString key + BlockParticleSet data
-        for (entries) |entry| {
+        for (ents) |entry| {
             // Key (VarString)
             const key_vi_len = serializer.writeVarInt(&vi_buf, @intCast(entry.key.len));
             try buf.appendSlice(allocator, vi_buf[0..key_vi_len]);
@@ -69,21 +69,11 @@ pub fn serialize(
     return buf.toOwnedSlice(allocator);
 }
 
-/// Build empty packet (3 bytes)
-/// FIXED=2: nullBits(1) + type(1) + VarInt 0(1) = 3 bytes (no maxId)
-pub fn buildEmptyPacket(allocator: std.mem.Allocator) ![]u8 {
-    const buf = try allocator.alloc(u8, 3);
-    buf[0] = 0x01; // nullBits: dictionary present
-    buf[1] = 0x00; // type = Init
-    buf[2] = 0x00; // VarInt count = 0
-    return buf;
-}
-
 test "UpdateBlockParticleSets empty packet size" {
     const allocator = std.testing.allocator;
-    const pkt = try buildEmptyPacket(allocator);
+    const pkt = try serialize(allocator, .init, null);
     defer allocator.free(pkt);
-    try std.testing.expectEqual(@as(usize, 3), pkt.len);
+    try std.testing.expectEqual(@as(usize, 2), pkt.len);
 }
 
 test "UpdateBlockParticleSets with entries" {

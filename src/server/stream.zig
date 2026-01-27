@@ -8,6 +8,8 @@ const auth = @import("../auth/auth.zig");
 const assets = @import("../assets/mod.zig");
 const Server = @import("server.zig").Server;
 const Connection = @import("connection.zig").Connection;
+const JoinSequence = @import("join.zig").JoinSequence;
+const World = @import("../world/world.zig").World;
 
 const log = std.log.scoped(.stream);
 
@@ -421,6 +423,19 @@ pub const Stream = struct {
         return &server.asset_registry;
     }
 
+    /// Get the world from the server through the connection chain
+    fn getWorld(self: *Self) ?*World {
+        // Get Connection from our context
+        const conn_ptr = self.connection orelse return null;
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        // Get Server from Connection's server_context
+        const server_ptr = conn.server_context orelse return null;
+        const server: *Server = @ptrCast(@alignCast(server_ptr));
+
+        return server.world;
+    }
+
     /// Send all asset Update* packets to the client
     fn sendAssetPackets(self: *Self, reg: *assets.AssetRegistry) !void {
         log.info("Generating asset packets...", .{});
@@ -456,11 +471,35 @@ pub const Stream = struct {
     fn handlePlayerOptions(self: *Self, payload: []const u8) void {
         log.info("Received PlayerOptions, len={d}", .{payload.len});
 
-        // This is the final step - client is ready to enter world
-        self.phase = .playing;
+        // This signals the client is ready to enter the world
+        // Begin the join sequence
+        self.phase = .loading;
 
-        // TODO: Add player to universe, spawn entity, etc.
-        log.info("Client fully connected!", .{});
+        // Get the server's world through the connection chain
+        const world = self.getWorld();
+        if (world == null) {
+            log.err("No world available - cannot join player", .{});
+            self.sendDisconnect("Server has no world configured") catch {};
+            return;
+        }
+
+        // Get connection for join sequence
+        const conn_ptr = self.connection orelse {
+            log.err("No connection context - cannot join player", .{});
+            return;
+        };
+        const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+
+        // Execute join sequence
+        var join_seq = JoinSequence.init(self.allocator, conn, world.?, 6);
+        join_seq.execute() catch |err| {
+            log.err("Join sequence failed: {}", .{err});
+            self.sendDisconnect("Failed to join world") catch {};
+            return;
+        };
+
+        self.phase = .playing;
+        log.info("Join sequence complete - client {} is now playing!", .{conn.client_id});
     }
 
     fn handleClientReady(_: *Self, payload: []const u8) void {
