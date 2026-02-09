@@ -22,6 +22,8 @@ const trail = @import("types/trail.zig");
 const entity_effect = @import("types/entity_effect.zig");
 const block_type = @import("types/block_type.zig");
 
+const DebugConfig = @import("../server/config.zig").DebugConfig;
+
 const log = std.log.scoped(.asset_registry);
 
 const UpdateType = common.UpdateType;
@@ -708,10 +710,34 @@ pub const AssetRegistry = struct {
         const BlockTypeAsset = block_type.BlockTypeAsset;
         const BlockTypeEntry = asset_packets.UpdateBlockTypes.BlockTypeEntry;
 
+        const debug_cfg = DebugConfig.get();
+
+        if (debug_cfg.minimal_blocks) {
+            // Minimal mode: send ONLY the air block (ID 0, drawType=empty, no name)
+            log.warn("DEBUG: minimal_blocks mode — sending only air block", .{});
+            var entries: [1]BlockTypeEntry = undefined;
+            entries[0] = .{ .id = 0, .block_type = try BlockTypeAsset.air(self.allocator) };
+
+            const payload = try asset_packets.UpdateBlockTypes.serialize(
+                self.allocator,
+                .init,
+                0, // maxId = 0 (AIR only)
+                &entries,
+            );
+
+            try packets.append(self.allocator, .{
+                .packet_id = asset_packets.UpdateBlockTypes.PACKET_ID,
+                .payload = payload,
+            });
+
+            log.debug("Generated UpdateBlockTypes (minimal): 1 entry, {d} bytes", .{payload.len});
+            return;
+        }
+
         // Define basic block types matching constants.BlockId
         // AIR = 0, BEDROCK = 1, STONE = 2, DIRT = 3, GRASS = 4
         var entries: [5]BlockTypeEntry = undefined;
-        entries[0] = .{ .id = 0, .block_type = BlockTypeAsset.air() };
+        entries[0] = .{ .id = 0, .block_type = try BlockTypeAsset.air(self.allocator) };
         entries[1] = .{ .id = 1, .block_type = try BlockTypeAsset.solid(self.allocator, "Bedrock") };
         entries[2] = .{ .id = 2, .block_type = try BlockTypeAsset.solid(self.allocator, "Stone") };
         entries[3] = .{ .id = 3, .block_type = try BlockTypeAsset.solid(self.allocator, "Dirt") };

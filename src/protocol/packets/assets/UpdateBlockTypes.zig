@@ -95,10 +95,12 @@ test "UpdateBlockTypes empty packet size" {
 test "UpdateBlockTypes with entries" {
     const allocator = std.testing.allocator;
 
+    var air0 = try BlockTypeAsset.air(allocator);
+    defer if (air0.cube_textures) |*tex| tex.deinit(allocator);
     var block1 = try BlockTypeAsset.solid(allocator, null);
     defer if (block1.cube_textures) |*tex| tex.deinit(allocator);
     const entries = [_]BlockTypeEntry{
-        .{ .id = 0, .block_type = BlockTypeAsset.air() },
+        .{ .id = 0, .block_type = air0 },
         .{ .id = 1, .block_type = block1 },
     };
 
@@ -122,8 +124,10 @@ test "UpdateBlockTypes block 0 (air) has correct nullBits" {
     const allocator = std.testing.allocator;
 
     // Send only air block (block 0)
+    var air0 = try BlockTypeAsset.air(allocator);
+    defer if (air0.cube_textures) |*tex| tex.deinit(allocator);
     const entries = [_]BlockTypeEntry{
-        .{ .id = 0, .block_type = BlockTypeAsset.air() },
+        .{ .id = 0, .block_type = air0 },
     };
 
     const pkt = try serialize(allocator, .init, 0, &entries);
@@ -152,12 +156,11 @@ test "UpdateBlockTypes block 0 (air) has correct nullBits" {
     // Verify block ID 0
     try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[11..15], .little));
 
-    // Verify BlockType nullBits for air block
-    // Air blocks have NO name and NO cube textures
-    try std.testing.expectEqual(@as(u8, 0), pkt[15]); // nullBits[0]: no item
-    try std.testing.expectEqual(@as(u8, 0x00), pkt[16]); // nullBits[1]: no name, no cubeTextures
-    try std.testing.expectEqual(@as(u8, 0), pkt[17]); // nullBits[2]
-    try std.testing.expectEqual(@as(u8, 0), pkt[18]); // nullBits[3]
+    // Verify BlockType nullBits for air block (matches Java block_0.bin exactly)
+    try std.testing.expectEqual(@as(u8, 0x3C), pkt[15]); // nullBits[0]: tint|biomeTint|movementSettings|flags
+    try std.testing.expectEqual(@as(u8, 0xEB), pkt[16]); // nullBits[1]: name|shaderEffect|modelTexture|support|supporting|cubeTextures
+    try std.testing.expectEqual(@as(u8, 0x00), pkt[17]); // nullBits[2]
+    try std.testing.expectEqual(@as(u8, 0x04), pkt[18]); // nullBits[3]: interactions
 
     // Verify draw_type = empty (0) at offset 19 (after 4 nullBits bytes)
     try std.testing.expectEqual(@as(u8, 0), pkt[19]); // unknown = false
@@ -207,11 +210,11 @@ test "UpdateBlockTypes solid block (no air) has correct bytes" {
     try std.testing.expectEqual(@as(i32, 1), std.mem.readInt(i32, pkt[11..15], .little));
 
     // Verify BlockType nullBits for Bedrock
-    // nullBits[0] = 0x00 (no item)
+    // nullBits[0] = 0x3C (tint|biomeTint|movementSettings|flags)
     // nullBits[1] = 0x81 (name present bit 0 + cubeTextures present bit 7)
     // nullBits[2] = 0x00
     // nullBits[3] = 0x00
-    try std.testing.expectEqual(@as(u8, 0x00), pkt[15]); // nullBits[0]
+    try std.testing.expectEqual(@as(u8, 0x3C), pkt[15]); // nullBits[0]: tint|biomeTint|movementSettings|flags
     try std.testing.expectEqual(@as(u8, 0x81), pkt[16]); // nullBits[1]: name bit + cubeTextures bit
     try std.testing.expectEqual(@as(u8, 0x00), pkt[17]); // nullBits[2]
     try std.testing.expectEqual(@as(u8, 0x00), pkt[18]); // nullBits[3]
@@ -235,6 +238,8 @@ test "UpdateBlockTypes registry simulation (5 blocks including air)" {
     const allocator = std.testing.allocator;
 
     // Simulate exactly what generateBlockTypesPacket does in registry.zig
+    var air0 = try BlockTypeAsset.air(allocator);
+    defer if (air0.cube_textures) |*tex| tex.deinit(allocator);
     var block1 = try BlockTypeAsset.solid(allocator, "Bedrock");
     defer if (block1.cube_textures) |*tex| tex.deinit(allocator);
     var block2 = try BlockTypeAsset.solid(allocator, "Stone");
@@ -245,7 +250,7 @@ test "UpdateBlockTypes registry simulation (5 blocks including air)" {
     defer if (block4.cube_textures) |*tex| tex.deinit(allocator);
 
     const entries = [_]BlockTypeEntry{
-        .{ .id = 0, .block_type = BlockTypeAsset.air() },
+        .{ .id = 0, .block_type = air0 },
         .{ .id = 1, .block_type = block1 },
         .{ .id = 2, .block_type = block2 },
         .{ .id = 3, .block_type = block3 },
@@ -267,33 +272,24 @@ test "UpdateBlockTypes registry simulation (5 blocks including air)" {
 
     // First entry: Block 0 (air)
     // [11-14]: key = 0
-    // [15-18]: nullBits = 0x00 0x00 0x00 0x00 (no fields)
+    // [15-18]: nullBits = 0x3C 0xEB 0x00 0x04 (matches Java air)
     // [19]: unknown = 0
     // [20]: draw_type = 0 (empty)
     try std.testing.expectEqual(@as(i32, 0), std.mem.readInt(i32, pkt[11..15], .little)); // block ID 0
-    try std.testing.expectEqual(@as(u8, 0x00), pkt[15]); // nullBits[0]
-    try std.testing.expectEqual(@as(u8, 0x00), pkt[16]); // nullBits[1] - NO name flag!
+    try std.testing.expectEqual(@as(u8, 0x3C), pkt[15]); // nullBits[0]: tint|biomeTint|movementSettings|flags
+    try std.testing.expectEqual(@as(u8, 0xEB), pkt[16]); // nullBits[1]: name|shaderEffect|modelTexture|support|supporting|cubeTextures
     try std.testing.expectEqual(@as(u8, 0x00), pkt[17]); // nullBits[2]
-    try std.testing.expectEqual(@as(u8, 0x00), pkt[18]); // nullBits[3]
+    try std.testing.expectEqual(@as(u8, 0x04), pkt[18]); // nullBits[3]: interactions
     try std.testing.expectEqual(@as(u8, 0), pkt[19]); // unknown = false
     try std.testing.expectEqual(@as(u8, 0), pkt[20]); // draw_type = empty (0)
     try std.testing.expectEqual(@as(u8, 0), pkt[21]); // material = empty (0)
-    try std.testing.expectEqual(@as(u8, 0), pkt[22]); // opacity = solid (0)
+    try std.testing.expectEqual(@as(u8, 3), pkt[22]); // opacity = transparent (3)
 
-    // Verify the CRITICAL condition is met for air block:
-    // If draw_type == empty (0), then nullBits[1] bit 0 MUST be 0 (no name)
-    const air_draw_type = pkt[20];
-    const air_has_name = (pkt[16] & 0x01) != 0;
-    if (air_draw_type == 0 and air_has_name) {
-        // This would cause "Block type with EmptyBlockId but has name" error
-        return error.InvalidAirBlockHasName;
-    }
-
-    // Verify entry boundaries:
-    // Entry 0 (air): key at 11-14, BlockType data at 15-273 (259 bytes)
-    // Entry 1 (bedrock): key at 274-277, BlockType data at 278+
+    // Compute air block size dynamically for entry boundary check
+    const air_data = try air0.serialize(allocator);
+    defer allocator.free(air_data);
     const air_block_data_start = 15; // After packet header and entry 0 key
-    const air_block_data_size = 259; // Air block with no variable fields
+    const air_block_data_size = air_data.len;
     const entry1_key_pos = air_block_data_start + air_block_data_size;
 
     // Verify entry 1 key (Bedrock, id = 1)
@@ -302,18 +298,20 @@ test "UpdateBlockTypes registry simulation (5 blocks including air)" {
     // Verify entry 1 BlockType data (Bedrock)
     const entry1_data_start = entry1_key_pos + 4;
     const entry1_nullbits = pkt[entry1_data_start .. entry1_data_start + 4];
-    // nullBits[0] = 0x00 (no item)
+    // nullBits[0] = 0x3C (tint|biomeTint|movementSettings|flags)
     // nullBits[1] = 0x81 (name present bit 0 + cubeTextures present bit 7)
-    try std.testing.expectEqual(@as(u8, 0x00), entry1_nullbits[0]);
+    try std.testing.expectEqual(@as(u8, 0x3C), entry1_nullbits[0]);
     try std.testing.expectEqual(@as(u8, 0x81), entry1_nullbits[1]);
     // Verify draw_type = cube (2) for Bedrock
     try std.testing.expectEqual(@as(u8, 2), pkt[entry1_data_start + 5]); // draw_type at offset 5 from BlockType start
 }
 
-test "UpdateBlockTypes all entries validated for EmptyBlockId+name constraint" {
+test "UpdateBlockTypes all entries have correct structure" {
     const allocator = std.testing.allocator;
 
     // Simulate the exact packet we send to the client
+    var air0 = try BlockTypeAsset.air(allocator);
+    defer if (air0.cube_textures) |*tex| tex.deinit(allocator);
     var block1 = try BlockTypeAsset.solid(allocator, "Bedrock");
     defer if (block1.cube_textures) |*tex| tex.deinit(allocator);
     var block2 = try BlockTypeAsset.solid(allocator, "Stone");
@@ -324,7 +322,7 @@ test "UpdateBlockTypes all entries validated for EmptyBlockId+name constraint" {
     defer if (block4.cube_textures) |*tex| tex.deinit(allocator);
 
     const entries_data = [_]BlockTypeEntry{
-        .{ .id = 0, .block_type = BlockTypeAsset.air() },
+        .{ .id = 0, .block_type = air0 },
         .{ .id = 1, .block_type = block1 },
         .{ .id = 2, .block_type = block2 },
         .{ .id = 3, .block_type = block3 },
@@ -356,25 +354,25 @@ test "UpdateBlockTypes all entries validated for EmptyBlockId+name constraint" {
         const null_bits = pkt[pos .. pos + 4];
         pos += 4;
 
-        // Read draw_type (byte 5 from BlockType start = position 4 + 1)
-        // Skip unknown byte (byte 0 after nullBits)
+        // All blocks should have tint, biomeTint, movementSettings, flags (0x3C)
+        try std.testing.expectEqual(@as(u8, 0x3C), null_bits[0] & 0x3C);
+
+        // Skip unknown byte
         pos += 1;
 
-        const actual_draw_type = pkt[pos]; // draw_type (byte 1 after nullBits)
+        const actual_draw_type = pkt[pos]; // draw_type
         pos += 1;
 
-        // Check constraint: if draw_type == 0 (Empty), name bit must be 0
-        const has_name = (null_bits[1] & 0x01) != 0;
-        if (actual_draw_type == 0) {
-            // This is an empty block (like air) - must NOT have name
-            try std.testing.expect(!has_name);
+        // Air block (entry 0) should be empty draw type, others should be cube
+        if (entry_idx == 0) {
+            try std.testing.expectEqual(@as(u8, 0), actual_draw_type); // empty
         } else {
-            // Non-empty block (like Bedrock) - CAN have name
-            // For our solid blocks, they SHOULD have names
-            if (entry_idx > 0) {
-                try std.testing.expect(has_name);
-            }
+            try std.testing.expectEqual(@as(u8, 2), actual_draw_type); // cube
         }
+
+        // All blocks should have names (Java air has name="Empty")
+        const has_name = (null_bits[1] & 0x01) != 0;
+        try std.testing.expect(has_name);
 
         // Skip to next entry (remaining block data)
         const remaining = block_sizes[entry_idx] - 6; // Already read 4 nullBits + 2 (unknown + draw_type)
@@ -382,5 +380,60 @@ test "UpdateBlockTypes all entries validated for EmptyBlockId+name constraint" {
     }
 
     // Verify we consumed the entire packet
+    try std.testing.expectEqual(pkt.len, pos);
+}
+
+test "UpdateBlockTypes computeBytesConsumed walk matches packet length" {
+    const allocator = std.testing.allocator;
+    const computeBytesConsumed = block_type.computeBytesConsumed;
+
+    // Build the exact 5-block packet the server sends
+    var air0 = try BlockTypeAsset.air(allocator);
+    defer if (air0.cube_textures) |*tex| tex.deinit(allocator);
+    var block1 = try BlockTypeAsset.solid(allocator, "Bedrock");
+    defer if (block1.cube_textures) |*tex| tex.deinit(allocator);
+    var block2 = try BlockTypeAsset.solid(allocator, "Stone");
+    defer if (block2.cube_textures) |*tex| tex.deinit(allocator);
+    var block3 = try BlockTypeAsset.solid(allocator, "Dirt");
+    defer if (block3.cube_textures) |*tex| tex.deinit(allocator);
+    var block4 = try BlockTypeAsset.solid(allocator, "Grass");
+    defer if (block4.cube_textures) |*tex| tex.deinit(allocator);
+
+    const entries_data = [_]BlockTypeEntry{
+        .{ .id = 0, .block_type = air0 },
+        .{ .id = 1, .block_type = block1 },
+        .{ .id = 2, .block_type = block2 },
+        .{ .id = 3, .block_type = block3 },
+        .{ .id = 4, .block_type = block4 },
+    };
+
+    const pkt = try serialize(allocator, .init, 4, &entries_data);
+    defer allocator.free(pkt);
+
+    // Walk packet the way Java's UpdateBlockTypes.deserialize() would:
+    // Header: 10 bytes fixed + 1 byte VarInt count = 11 bytes
+    var pos: usize = 11;
+
+    for (0..5) |entry_idx| {
+        // Read 4-byte key
+        const block_id = std.mem.readInt(i32, pkt[pos..][0..4], .little);
+        try std.testing.expectEqual(@as(i32, @intCast(entry_idx)), block_id);
+        pos += 4;
+
+        // Use computeBytesConsumed to walk the BlockType, like the client does
+        const consumed = computeBytesConsumed(pkt, pos) orelse {
+            std.debug.print("computeBytesConsumed returned null at pos {d} for entry {d}\n", .{ pos, entry_idx });
+            return error.ComputeFailed;
+        };
+
+        // Cross-validate: serialize each block independently and check sizes match
+        const individual = try entries_data[entry_idx].block_type.serialize(allocator);
+        defer allocator.free(individual);
+        try std.testing.expectEqual(individual.len, consumed);
+
+        pos += consumed;
+    }
+
+    // Total consumed bytes must equal entire packet length
     try std.testing.expectEqual(pkt.len, pos);
 }
