@@ -5,7 +5,7 @@ const log = std.log.scoped(.session);
 /// Get current Unix timestamp (seconds since 1970) using std.Io
 fn getTimestamp() i64 {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const ts = std.Io.Clock.real.now(io) catch return 0;
+    const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s));
 }
 

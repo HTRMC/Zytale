@@ -11,7 +11,7 @@ const log = std.log.scoped(.server_credentials);
 /// Get current Unix timestamp using std.Io
 fn getTimestamp() i64 {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const ts = std.Io.Clock.real.now(io) catch return 0;
+    const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s));
 }
 
@@ -194,7 +194,7 @@ pub const ServerCredentials = struct {
             const name_w_z: [:0]const u16 = name_w[0..name_w_len :0];
 
             const Environ = std.process.Environ;
-            if (Environ.getWindows(.{ .block = {} }, name_w_z)) |value_w| {
+            if (Environ.getWindows(.{ .block = .global }, name_w_z)) |value_w| {
                 // Convert UTF-16 result to UTF-8 in thread-local buffer
                 const len = std.unicode.wtf16LeToWtf8(&env_buffer, value_w);
                 return env_buffer[0..len];

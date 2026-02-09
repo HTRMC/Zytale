@@ -11,7 +11,7 @@ pub const DEFAULT_CREDENTIAL_FILE = "server_auth.json";
 /// Get current Unix timestamp using std.Io
 fn getTimestamp() i64 {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const ts = std.Io.Clock.real.now(io) catch return 0;
+    const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s));
 }
 

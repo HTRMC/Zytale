@@ -16,20 +16,21 @@ pub const DebugConfig = struct {
     pub fn initFromEnv() DebugConfig {
         var cfg = DebugConfig{};
 
-        if (std.process.getEnvVarOwned(std.heap.page_allocator, "ZYTALE_NO_COMPRESS")) |val| {
-            defer std.heap.page_allocator.free(val);
+        const environ: std.process.Environ = .{ .block = .global };
+        var env_map = environ.createMap(std.heap.page_allocator) catch return cfg;
+        defer env_map.deinit();
+
+        if (env_map.get("ZYTALE_NO_COMPRESS")) |val| {
             cfg.bypass_compression = std.mem.eql(u8, val, "1");
-        } else |_| {}
+        }
 
-        if (std.process.getEnvVarOwned(std.heap.page_allocator, "ZYTALE_MINIMAL_BLOCKS")) |val| {
-            defer std.heap.page_allocator.free(val);
+        if (env_map.get("ZYTALE_MINIMAL_BLOCKS")) |val| {
             cfg.minimal_blocks = std.mem.eql(u8, val, "1");
-        } else |_| {}
+        }
 
-        if (std.process.getEnvVarOwned(std.heap.page_allocator, "ZYTALE_HEX_DUMP")) |val| {
-            defer std.heap.page_allocator.free(val);
+        if (env_map.get("ZYTALE_HEX_DUMP")) |val| {
             cfg.hex_dump_packets = std.mem.eql(u8, val, "1");
-        } else |_| {}
+        }
 
         if (cfg.bypass_compression) log.warn("DEBUG: compression bypass ENABLED (ZYTALE_NO_COMPRESS=1)", .{});
         if (cfg.minimal_blocks) log.warn("DEBUG: minimal blocks mode ENABLED (ZYTALE_MINIMAL_BLOCKS=1)", .{});

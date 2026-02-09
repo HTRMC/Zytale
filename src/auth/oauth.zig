@@ -5,7 +5,7 @@ const log = std.log.scoped(.oauth);
 /// Get current Unix timestamp using std.Io
 fn getTimestamp() i64 {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const ts = std.Io.Clock.real.now(io) catch return 0;
+    const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s));
 }
 
@@ -63,7 +63,7 @@ pub const OAuthEndpoints = struct {
         const Environ = std.process.Environ;
 
         // Device authorization URL
-        if (Environ.getWindows(.{ .block = {} }, std.unicode.wtf8ToWtf16LeStringLiteral(ENV_DEVICE_AUTH_URL))) |value_w| {
+        if (Environ.getWindows(.{ .block = .global }, std.unicode.wtf8ToWtf16LeStringLiteral(ENV_DEVICE_AUTH_URL))) |value_w| {
             if (std.unicode.wtf16LeToWtf8Alloc(allocator, value_w)) |url| {
                 endpoints.device_authorization = url;
                 endpoints.device_authorization_owned = true;
@@ -72,7 +72,7 @@ pub const OAuthEndpoints = struct {
         }
 
         // Token URL
-        if (Environ.getWindows(.{ .block = {} }, std.unicode.wtf8ToWtf16LeStringLiteral(ENV_TOKEN_URL))) |value_w| {
+        if (Environ.getWindows(.{ .block = .global }, std.unicode.wtf8ToWtf16LeStringLiteral(ENV_TOKEN_URL))) |value_w| {
             if (std.unicode.wtf16LeToWtf8Alloc(allocator, value_w)) |url| {
                 endpoints.token = url;
                 endpoints.token_owned = true;

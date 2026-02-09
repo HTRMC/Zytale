@@ -53,7 +53,7 @@ pub const Server = struct {
     // Connection management
     connections: std.AutoHashMap(u32, *Connection),
     next_client_id: u32,
-    mutex: std.Thread.Mutex,
+    mutex: std.Io.Mutex,
 
     // Server state
     running: bool,
@@ -82,7 +82,7 @@ pub const Server = struct {
             .cert = null,
             .connections = std.AutoHashMap(u32, *Connection).init(allocator),
             .next_client_id = 1,
-            .mutex = .{},
+            .mutex = std.Io.Mutex.init,
             .running = false,
             .session_client = auth.SessionServiceClient.init(allocator),
             .server_credentials = credentials,
@@ -377,10 +377,11 @@ pub const Server = struct {
         });
 
         // Assign client ID
-        self.mutex.lock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
         const client_id = self.next_client_id;
         self.next_client_id += 1;
-        self.mutex.unlock();
+        self.mutex.unlock(io);
 
         // Create connection wrapper
         const conn = try self.allocator.create(Connection);
@@ -398,9 +399,9 @@ pub const Server = struct {
         conn.setAuthContext(&self.session_client, self.server_credentials);
 
         // Register connection
-        self.mutex.lock();
+        self.mutex.lockUncancelable(io);
         try self.connections.put(client_id, conn);
-        self.mutex.unlock();
+        self.mutex.unlock(io);
 
         // Set callback handler
         api.set_callback_handler(connection_handle, @ptrCast(@constCast(&connectionCallback)), conn);
@@ -417,22 +418,25 @@ pub const Server = struct {
 
     /// Get a connection by client ID
     pub fn getConnection(self: *Self, client_id: u32) ?*Connection {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         return self.connections.get(client_id);
     }
 
     /// Remove a connection
     pub fn removeConnection(self: *Self, client_id: u32) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         _ = self.connections.remove(client_id);
     }
 
     /// Get current connection count
     pub fn connectionCount(self: *Self) usize {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
         return self.connections.count();
     }
 };

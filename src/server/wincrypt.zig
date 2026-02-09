@@ -222,7 +222,7 @@ pub fn generateSelfSignedCert(allocator: std.mem.Allocator, config: CertConfig) 
     // First create as UTF-8, then convert to UTF-16 for Windows API
     var key_name_u8: [64]u8 = undefined;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const ts = std.Io.Clock.real.now(io) catch std.Io.Timestamp{ .nanoseconds = 0 };
+    const ts = std.Io.Clock.real.now(io);
     const key_name_len = (std.fmt.bufPrint(&key_name_u8, "ZytaleCert-{d}", .{ts.nanoseconds}) catch {
         return error.KeyNameTooLong;
     }).len;

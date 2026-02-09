@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const DynLib = @import("dynlib").DynLib;
 
 /// Zstd compression wrapper for Hytale packet compression
 /// 60 packets in the registry are marked compressed: true and require Zstd
@@ -46,7 +47,7 @@ const ZSTD_getFrameContentSizeFn = *const fn (src: [*]const u8, src_size: usize)
 
 /// Zstd library wrapper with lazy loading
 pub const ZstdLib = struct {
-    dll: ?std.DynLib,
+    dll: ?DynLib,
     compress_fn: ?ZSTD_compressFn,
     decompress_fn: ?ZSTD_decompressFn,
     is_error_fn: ?ZSTD_isErrorFn,
@@ -75,9 +76,9 @@ pub const ZstdLib = struct {
             else => [_][]const u8{ "libzstd.so", "libzstd.so.1" },
         };
 
-        var dll: ?std.DynLib = null;
+        var dll: ?DynLib = null;
         for (dll_names) |name| {
-            dll = std.DynLib.open(name) catch continue;
+            dll = DynLib.open(name) catch continue;
             if (dll != null) break;
         }
 

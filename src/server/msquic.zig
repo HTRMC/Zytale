@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const DynLib = @import("dynlib").DynLib;
 
 /// MsQuic Library Bindings for Zig
 /// Windows QUIC implementation via msquic.dll
@@ -515,7 +516,7 @@ pub const QUIC_API_TABLE = extern struct {
 
 // MsQuic library wrapper
 pub const MsQuic = struct {
-    dll: std.DynLib,
+    dll: DynLib,
     api: *const QUIC_API_TABLE,
     dll_path: ?[]const u8,
     allocator: std.mem.Allocator,
@@ -529,7 +530,7 @@ pub const MsQuic = struct {
 
         // 1. Check MSQUIC_PATH environment variable
         const Environ = std.process.Environ;
-        if (Environ.getWindows(.{ .block = {} }, std.unicode.wtf8ToWtf16LeStringLiteral("MSQUIC_PATH"))) |value_w| {
+        if (Environ.getWindows(.{ .block = .global }, std.unicode.wtf8ToWtf16LeStringLiteral("MSQUIC_PATH"))) |value_w| {
             if (std.unicode.wtf16LeToWtf8Alloc(allocator, value_w)) |path| {
                 // Verify the file exists
                 if (std.Io.Dir.access(.cwd(), io, path, .{})) |_| {
@@ -605,7 +606,7 @@ pub const MsQuic = struct {
 
         const dll_name = dll_path orelse "msquic.dll";
 
-        var dll = std.DynLib.open(dll_name) catch |err| {
+        var dll = DynLib.open(dll_name) catch |err| {
             std.log.err("Failed to load msquic.dll. Tried locations:", .{});
             std.log.err("  1. MSQUIC_PATH environment variable", .{});
             std.log.err("  2. packages/Microsoft.MsQuic.*/runtimes/win-x64/native/msquic.dll", .{});

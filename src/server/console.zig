@@ -9,7 +9,7 @@ const log = std.log.scoped(.console);
 /// Get current Unix timestamp using std.Io
 fn getTimestamp() i64 {
     const io = std.Io.Threaded.global_single_threaded.io();
-    const ts = std.Io.Clock.real.now(io) catch return 0;
+    const ts = std.Io.Clock.real.now(io);
     return @intCast(@divFloor(ts.nanoseconds, std.time.ns_per_s));
 }
 
@@ -104,7 +104,7 @@ pub const Console = struct {
     fn readStdinLine(buf: []u8) ![]u8 {
         if (builtin.os.tag == .windows) {
             const windows = std.os.windows;
-            const handle = windows.GetStdHandle(windows.STD_INPUT_HANDLE) catch return error.StdinUnavailable;
+            const handle = windows.peb().ProcessParameters.hStdInput;
 
             var bytes_read: u32 = 0;
             var i: usize = 0;

@@ -4,6 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // Dynamic library loader (cross-platform, works on Windows unlike std.DynLib)
+    const dynlib_module = b.createModule(.{
+        .root_source_file = b.path("src/util/dynlib.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // Protocol module (shared)
     const protocol_module = b.createModule(.{
         .root_source_file = b.path("src/protocol/PacketRegistry.zig"),
@@ -20,6 +27,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "protocol", .module = protocol_module },
+                .{ .name = "dynlib", .module = dynlib_module },
             },
         }),
     });
@@ -82,6 +90,9 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(test_path),
                 .target = target,
                 .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "dynlib", .module = dynlib_module },
+                },
             }),
         });
 
@@ -99,6 +110,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "protocol", .module = protocol_module },
+                .{ .name = "dynlib", .module = dynlib_module },
             },
         }),
     });
