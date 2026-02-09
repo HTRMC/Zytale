@@ -10,6 +10,7 @@ const Server = @import("server.zig").Server;
 const Connection = @import("connection.zig").Connection;
 const JoinSequence = @import("join.zig").JoinSequence;
 const World = @import("../world/world.zig").World;
+const DebugConfig = @import("config.zig").DebugConfig;
 
 const log = std.log.scoped(.stream);
 
@@ -605,9 +606,24 @@ pub const Stream = struct {
     /// Buffer lifetime: the encoded frame is kept alive until MsQuic fires SEND_COMPLETE
     /// Automatically compresses packets that have compressed=true in the registry
     pub fn sendPacket(self: *Self, packet_id: u32, payload: []const u8) !void {
+        const debug_cfg = DebugConfig.get();
+
         // Check if this packet type requires compression
         const packet_info = registry.getById(packet_id);
-        const should_compress = packet_info != null and packet_info.?.compressed;
+        const wants_compress = packet_info != null and packet_info.?.compressed;
+        const should_compress = wants_compress and !debug_cfg.bypass_compression;
+
+        // Hex dump pre-compression payload if requested
+        if (debug_cfg.hex_dump_packets) {
+            const name = registry.getName(packet_id);
+            const dump_len = @min(payload.len, 128);
+            log.warn("HEX [{s}] ID={d} pre-compress ({d} bytes, showing {d}):", .{ name, packet_id, payload.len, dump_len });
+            hexDumpLine(payload[0..dump_len]);
+        }
+
+        if (wants_compress and debug_cfg.bypass_compression) {
+            log.warn("DEBUG: skipping compression for packet {d} ({d} bytes)", .{ packet_id, payload.len });
+        }
 
         // Compress payload if needed
         const final_payload: []u8 = if (should_compress) blk: {
@@ -621,6 +637,13 @@ pub const Stream = struct {
             // For uncompressed packets, dupe the payload since we manage its lifetime
             break :blk try self.allocator.dupe(u8, payload);
         };
+
+        // Hex dump post-compression payload if requested
+        if (debug_cfg.hex_dump_packets and should_compress) {
+            const dump_len = @min(final_payload.len, 128);
+            log.warn("HEX post-compress ({d} bytes, showing {d}):", .{ final_payload.len, dump_len });
+            hexDumpLine(final_payload[0..dump_len]);
+        }
 
         const encoded = frame.encodeFrame(self.allocator, packet_id, final_payload) catch |err| {
             self.allocator.free(final_payload);
@@ -702,6 +725,28 @@ pub const Stream = struct {
         self.api.stream_close(self.handle);
     }
 };
+
+/// Hex-dump a slice in rows of 16 bytes (debug utility).
+fn hexDumpLine(data: []const u8) void {
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const end = @min(offset + 16, data.len);
+        const row = data[offset..end];
+        // Print up to 16 bytes per line
+        var hex_buf: [16 * 3]u8 = undefined;
+        var hex_len: usize = 0;
+        for (row) |b| {
+            const hi: u8 = "0123456789abcdef"[b >> 4];
+            const lo: u8 = "0123456789abcdef"[b & 0x0f];
+            hex_buf[hex_len] = hi;
+            hex_buf[hex_len + 1] = lo;
+            hex_buf[hex_len + 2] = ' ';
+            hex_len += 3;
+        }
+        log.warn("  {x:0>4}: {s}", .{ offset, hex_buf[0..hex_len] });
+        offset = end;
+    }
+}
 
 /// Stream callback handler for MsQuic
 pub fn streamCallback(
