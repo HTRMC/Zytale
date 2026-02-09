@@ -63,6 +63,9 @@ pub const AssetRegistry = struct {
     /// Entity effects
     entity_effects: IndexedAssetMap(entity_effect.EntityEffectAsset),
 
+    /// Block types
+    block_types: IndexedAssetMap(block_type.BlockTypeAsset),
+
     /// Whether assets have been loaded
     loaded: bool,
 
@@ -82,6 +85,7 @@ pub const AssetRegistry = struct {
             .trails = IndexedAssetMap(trail.TrailAsset).init(allocator),
             .environments = IndexedAssetMap(asset_packets.UpdateEnvironments.EnvironmentAsset).init(allocator),
             .entity_effects = IndexedAssetMap(entity_effect.EntityEffectAsset).init(allocator),
+            .block_types = IndexedAssetMap(block_type.BlockTypeAsset).init(allocator),
             .loaded = false,
             .total_assets = 0,
         };
@@ -135,6 +139,13 @@ pub const AssetRegistry = struct {
         }
         self.entity_effects.deinit();
 
+        var bt_iter = self.block_types.iterator();
+        while (bt_iter.next()) |entry| {
+            var asset = entry.value.*;
+            asset.deinit(self.allocator);
+        }
+        self.block_types.deinit();
+
         self.environments.deinit();
     }
 
@@ -154,6 +165,7 @@ pub const AssetRegistry = struct {
         log.info("Asset store indexed {d} files", .{self.asset_store.?.count()});
 
         // Load individual asset types from ZIP
+        try self.loadBlockTypesFromZip();
         try self.loadAudioCategoriesFromZip();
         try self.loadReverbEffectsFromZip();
         try self.loadEqualizerEffectsFromZip();
@@ -166,6 +178,60 @@ pub const AssetRegistry = struct {
 
         self.loaded = true;
         log.info("Asset registry loaded: {d} total assets", .{self.total_assets});
+    }
+
+    /// Load BlockTypes from ZIP
+    fn loadBlockTypesFromZip(self: *Self) !void {
+        const BlockTypeAsset = block_type.BlockTypeAsset;
+        const asset_store_ptr = &self.asset_store.?;
+        const prefix = common.getZipPath(.block_types);
+
+        // Always register air block at index 0
+        _ = try self.block_types.put("Empty", try BlockTypeAsset.air(self.allocator));
+
+        var iter = asset_store_ptr.iterateDirectory(prefix);
+        var loaded: usize = 0;
+        var failed: usize = 0;
+
+        while (iter.next()) |info| {
+            if (!std.mem.endsWith(u8, info.path, ".json")) continue;
+
+            const content = asset_store_ptr.readAsset(info.path) catch |err| {
+                log.warn("Failed to read {s}: {}", .{ info.path, err });
+                failed += 1;
+                continue;
+            };
+            defer self.allocator.free(content);
+
+            const asset_id = json.extractAssetId(self.allocator, info.path) catch |err| {
+                log.warn("Failed to extract ID from {s}: {}", .{ info.path, err });
+                failed += 1;
+                continue;
+            };
+            defer self.allocator.free(asset_id);
+
+            // Skip "Empty" — already registered as air
+            if (std.mem.eql(u8, asset_id, "Empty")) continue;
+
+            const asset = BlockTypeAsset.parseJson(self.allocator, asset_id, content) catch |err| {
+                log.warn("Failed to parse block type {s}: {}", .{ info.path, err });
+                failed += 1;
+                continue;
+            };
+
+            _ = self.block_types.put(asset.name orelse asset_id, asset) catch |err| {
+                log.warn("Failed to store block type {s}: {}", .{ asset_id, err });
+                var mutable_asset = asset;
+                mutable_asset.deinit(self.allocator);
+                failed += 1;
+                continue;
+            };
+
+            loaded += 1;
+        }
+
+        self.total_assets += loaded + 1; // +1 for air
+        log.info("Loaded {d} BlockTypes ({d} failed)", .{ loaded + 1, failed });
     }
 
     /// Load AudioCategories from ZIP
@@ -424,6 +490,12 @@ pub const AssetRegistry = struct {
         log.info("Loaded {d} EntityEffects", .{loaded});
     }
 
+    /// Load placeholder block types (fallback when ZIP is unavailable)
+    fn loadPlaceholderBlockTypes(self: *Self) !void {
+        _ = try self.block_types.put("Empty", try block_type.BlockTypeAsset.air(self.allocator));
+        self.total_assets += 1;
+    }
+
     /// Load placeholder environments
     fn loadPlaceholderEnvironments(self: *Self) !void {
         _ = try self.environments.put("default", .{
@@ -451,6 +523,9 @@ pub const AssetRegistry = struct {
             });
             self.total_assets += 1;
         }
+
+        // Add placeholder block types
+        try self.loadPlaceholderBlockTypes();
 
         // Add placeholder environment
         try self.loadPlaceholderEnvironments();
@@ -705,23 +780,21 @@ pub const AssetRegistry = struct {
         });
     }
 
-    /// Generate block types packet with basic blocks for flat world
+    /// Generate block types packet from loaded block_types map
     fn generateBlockTypesPacket(self: *Self, packets: *std.ArrayList(GeneratedPacket)) !void {
-        const BlockTypeAsset = block_type.BlockTypeAsset;
         const BlockTypeEntry = asset_packets.UpdateBlockTypes.BlockTypeEntry;
 
         const debug_cfg = DebugConfig.get();
 
         if (debug_cfg.minimal_blocks) {
-            // Minimal mode: send ONLY the air block (ID 0, drawType=empty, no name)
             log.warn("DEBUG: minimal_blocks mode — sending only air block", .{});
             var entries: [1]BlockTypeEntry = undefined;
-            entries[0] = .{ .id = 0, .block_type = try BlockTypeAsset.air(self.allocator) };
+            entries[0] = .{ .id = 0, .block_type = try block_type.BlockTypeAsset.air(self.allocator) };
 
             const payload = try asset_packets.UpdateBlockTypes.serialize(
                 self.allocator,
                 .init,
-                0, // maxId = 0 (AIR only)
+                0,
                 &entries,
             );
 
@@ -734,20 +807,25 @@ pub const AssetRegistry = struct {
             return;
         }
 
-        // Define basic block types matching constants.BlockId
-        // AIR = 0, BEDROCK = 1, STONE = 2, DIRT = 3, GRASS = 4
-        var entries: [5]BlockTypeEntry = undefined;
-        entries[0] = .{ .id = 0, .block_type = try BlockTypeAsset.air(self.allocator) };
-        entries[1] = .{ .id = 1, .block_type = try BlockTypeAsset.solid(self.allocator, "Bedrock") };
-        entries[2] = .{ .id = 2, .block_type = try BlockTypeAsset.solid(self.allocator, "Stone") };
-        entries[3] = .{ .id = 3, .block_type = try BlockTypeAsset.solid(self.allocator, "Dirt") };
-        entries[4] = .{ .id = 4, .block_type = try BlockTypeAsset.solid(self.allocator, "Grass") };
+        // Build entries from loaded block_types map
+        var entries: std.ArrayList(BlockTypeEntry) = .empty;
+        defer entries.deinit(self.allocator);
+
+        var iter = self.block_types.constIterator();
+        while (iter.next()) |entry| {
+            try entries.append(self.allocator, .{
+                .id = entry.index,
+                .block_type = entry.value,
+            });
+        }
+
+        const max_id: u32 = if (self.block_types.maxId() > 0) self.block_types.maxId() - 1 else 0;
 
         const payload = try asset_packets.UpdateBlockTypes.serialize(
             self.allocator,
             .init,
-            4, // maxId = 4 (GRASS)
-            &entries,
+            max_id,
+            entries.items,
         );
 
         try packets.append(self.allocator, .{
@@ -755,29 +833,11 @@ pub const AssetRegistry = struct {
             .payload = payload,
         });
 
-        log.debug("Generated UpdateBlockTypes: {d} entries, {d} bytes", .{
-            entries.len,
+        log.info("Generated UpdateBlockTypes: {d} entries, {d} bytes, maxId={d}", .{
+            entries.items.len,
             payload.len,
+            max_id,
         });
-
-        // Debug hex dump of first block type (air block at offset 11 = 10 header + 1 varint)
-        // Packet structure: [0]=nullBits, [1]=type, [2-5]=maxId, [6-9]=4 bools, [10]=count, [11-14]=key0, [15+]=BlockType0
-        if (payload.len >= 25) {
-            log.info("UpdateBlockTypes hex dump (first 25 bytes):", .{});
-            log.info("  Header: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
-                payload[0], payload[1], payload[2], payload[3], payload[4],
-                payload[5], payload[6], payload[7], payload[8], payload[9],
-            });
-            log.info("  Count+Key0: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
-                payload[10], payload[11], payload[12], payload[13], payload[14],
-            });
-            log.info("  Block0 nullBits: {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
-                payload[15], payload[16], payload[17], payload[18],
-            });
-            log.info("  Block0 fields: unknown={x:0>2} drawType={x:0>2} material={x:0>2} opacity={x:0>2}", .{
-                payload[19], payload[20], payload[21], payload[22],
-            });
-        }
     }
 
     /// Generate empty packets for all required asset types not yet implemented

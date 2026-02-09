@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const json_util = @import("../json.zig");
 
 // Protocol constants - must match Java BlockType.java
 pub const NULLABLE_BIT_FIELD_SIZE: u32 = 4;
@@ -377,6 +378,10 @@ pub const BlockTypeAsset = struct {
     // Slot 23: connectedBlockRuleSet (raw serialized bytes)
     connected_block_rule_set: ?[]const u8 = null,
 
+    // ── Non-protocol bookkeeping ──
+    /// Whether this block owns its string allocations (true when created via parseJson)
+    owned: bool = false,
+
     const Self = @This();
 
     /// Serialize to protocol format matching Java BlockType.java exactly.
@@ -662,30 +667,328 @@ pub const BlockTypeAsset = struct {
         return block;
     }
 
-    /// Free all allocated memory owned by this block
+    /// Free all allocated memory owned by this block.
+    /// Only frees fields that were heap-allocated (duped strings, parsed textures).
     pub fn deinit(self: *Self, allocator: Allocator) void {
         if (self.cube_textures) |*tex| tex.deinit(allocator);
-        // Raw blob fields that were allocated
-        const raw_fields = [_]*?[]const u8{
-            &self.shader_effect,
-            &self.model_texture,
-            &self.support,
-            &self.supporting,
-            &self.particles,
-            &self.transition_to_groups,
-            &self.gathering,
-            &self.display,
-            &self.rail,
-            &self.interactions,
-            &self.states,
-            &self.tag_indexes,
-            &self.bench,
-            &self.connected_block_rule_set,
-        };
-        _ = raw_fields;
-        // Note: string fields (name, item, model, etc.) are typically borrowed,
-        // not owned. Only free if they were allocated by this struct.
-        // The caller is responsible for managing allocated string lifetimes.
+        // Free owned string fields (allocated via parseJson)
+        if (self.owned) {
+            const string_fields = [_]?[]const u8{
+                self.item,
+                self.name,
+                self.model,
+                self.model_animation,
+                self.cube_side_mask_texture,
+                self.block_particle_set_id,
+                self.block_breaking_decal_id,
+                self.transition_texture,
+                self.interaction_hint,
+            };
+            for (string_fields) |field| {
+                if (field) |s| allocator.free(s);
+            }
+        }
+    }
+
+    /// Parse a block type definition from JSON content.
+    /// The JSON is a flat block definition (the file IS the block type, not wrapped).
+    /// Example: { "DrawType": "Cube", "Material": "Solid", "Textures": [...] }
+    pub fn parseJson(allocator: Allocator, id: []const u8, content: []const u8) !Self {
+        var parsed = try json_util.parseJson(allocator, content);
+        defer parsed.deinit();
+
+        if (parsed.value != .object) return error.InvalidJson;
+        const obj = parsed.value.object;
+
+        var block = Self.default();
+        block.owned = true;
+
+        // Name = asset ID (filename without extension)
+        block.name = try allocator.dupe(u8, id);
+
+        // DrawType
+        if (json_util.getStringField(obj, "DrawType")) |dt| {
+            block.draw_type = parseDrawType(dt);
+        }
+
+        // Material
+        if (json_util.getStringField(obj, "Material")) |m| {
+            block.material = parseMaterial(m);
+        }
+
+        // Opacity
+        if (json_util.getStringField(obj, "Opacity")) |o| {
+            block.opacity = parseOpacity(o);
+        }
+
+        // Flags
+        if (json_util.getObjectField(obj, "Flags")) |flags_obj| {
+            block.flags = .{
+                .is_usable = json_util.getBoolField(flags_obj, "IsUsable") orelse false,
+                .is_stackable = json_util.getBoolField(flags_obj, "IsStackable") orelse true,
+            };
+        }
+
+        // Textures array → cube_textures (first entry)
+        if (json_util.getArrayField(obj, "Textures")) |tex_array| {
+            if (tex_array.items.len > 0) {
+                // Calculate total weight for normalization
+                var total_weight: f32 = 0;
+                for (tex_array.items) |tex_val| {
+                    if (tex_val == .object) {
+                        const w = json_util.getNumberFieldF32(tex_val.object, "Weight") orelse 1.0;
+                        total_weight += w;
+                    }
+                }
+                if (total_weight == 0) total_weight = 1.0;
+
+                // Parse first texture entry
+                if (tex_array.items[0] == .object) {
+                    block.cube_textures = try parseBlockTextures(allocator, tex_array.items[0].object, total_weight);
+                }
+            }
+        }
+
+        // ParticleColor (#RRGGBB hex string)
+        if (json_util.getStringField(obj, "ParticleColor")) |hex| {
+            if (parseHexColor(hex)) |c| {
+                block.particle_color = c;
+            }
+        }
+
+        // Light { Color, Radius }
+        if (json_util.getObjectField(obj, "Light")) |light_obj| {
+            var cl = ColorLight{};
+            if (json_util.getStringField(light_obj, "Color")) |hex| {
+                if (parseHexColor(hex)) |c| {
+                    cl.r = c.r;
+                    cl.g = c.g;
+                    cl.b = c.b;
+                }
+            }
+            cl.radius = if (json_util.getNumberFieldI32(light_obj, "Radius")) |r|
+                @intCast(@min(@max(r, 0), 255))
+            else
+                15; // default light radius
+            block.light = cl;
+        }
+
+        // RequiresAlphaBlending
+        if (json_util.getBoolField(obj, "RequiresAlphaBlending")) |b| {
+            block.requires_alpha_blending = b;
+        }
+
+        // MaxSupportDistance
+        if (json_util.getNumberFieldI32(obj, "MaxSupportDistance")) |d| {
+            block.max_support_distance = d;
+        }
+
+        // BlockSupportsRequiredFor
+        if (json_util.getStringField(obj, "SupportsRequiredFor")) |s| {
+            if (std.mem.eql(u8, s, "Any")) {
+                block.block_supports_required_for = .any;
+            } else {
+                block.block_supports_required_for = .all;
+            }
+        }
+
+        // CustomModel → model
+        if (json_util.getStringField(obj, "CustomModel")) |m| {
+            block.model = try allocator.dupe(u8, m);
+        }
+
+        // CustomModelScale
+        if (json_util.getNumberFieldF32(obj, "CustomModelScale")) |s| {
+            block.model_scale = s;
+        }
+
+        // CustomModelAnimation
+        if (json_util.getStringField(obj, "CustomModelAnimation")) |a| {
+            block.model_animation = try allocator.dupe(u8, a);
+        }
+
+        // TextureSideMask → cube_side_mask_texture
+        if (json_util.getStringField(obj, "TextureSideMask")) |t| {
+            block.cube_side_mask_texture = try allocator.dupe(u8, t);
+        }
+
+        // BlockParticleSetId
+        if (json_util.getStringField(obj, "BlockParticleSetId")) |s| {
+            block.block_particle_set_id = try allocator.dupe(u8, s);
+        }
+
+        // BlockBreakingDecalId
+        if (json_util.getStringField(obj, "BlockBreakingDecalId")) |s| {
+            block.block_breaking_decal_id = try allocator.dupe(u8, s);
+        }
+
+        // TransitionTexture
+        if (json_util.getStringField(obj, "TransitionTexture")) |s| {
+            block.transition_texture = try allocator.dupe(u8, s);
+        }
+
+        // InteractionHint
+        if (json_util.getStringField(obj, "InteractionHint")) |s| {
+            block.interaction_hint = try allocator.dupe(u8, s);
+        }
+
+        // MovementSettings
+        if (json_util.getObjectField(obj, "MovementSettings")) |ms_obj| {
+            block.movement_settings = .{
+                .is_climbable = json_util.getBoolField(ms_obj, "IsClimbable") orelse false,
+                .climb_up_speed_multiplier = json_util.getNumberFieldF32(ms_obj, "ClimbUpSpeedMultiplier") orelse 1.0,
+                .climb_down_speed_multiplier = json_util.getNumberFieldF32(ms_obj, "ClimbDownSpeedMultiplier") orelse 1.0,
+                .climb_lateral_speed_multiplier = json_util.getNumberFieldF32(ms_obj, "ClimbLateralSpeedMultiplier") orelse 1.0,
+                .is_bouncy = json_util.getBoolField(ms_obj, "IsBouncy") orelse false,
+                .bounce_velocity = json_util.getNumberFieldF32(ms_obj, "BounceVelocity") orelse 0.0,
+                .drag = json_util.getNumberFieldF32(ms_obj, "Drag") orelse 0.82,
+                .friction = json_util.getNumberFieldF32(ms_obj, "Friction") orelse 0.18,
+                .terminal_velocity_modifier = json_util.getNumberFieldF32(ms_obj, "TerminalVelocityModifier") orelse 1.0,
+                .horizontal_speed_multiplier = json_util.getNumberFieldF32(ms_obj, "HorizontalSpeedMultiplier") orelse 1.0,
+                .acceleration = json_util.getNumberFieldF32(ms_obj, "Acceleration") orelse 0.0,
+                .jump_force_multiplier = json_util.getNumberFieldF32(ms_obj, "JumpForceMultiplier") orelse 1.0,
+            };
+        }
+
+        // PlacementSettings
+        if (json_util.getObjectField(obj, "PlacementSettings")) |ps_obj| {
+            block.placement_settings = .{
+                .allow_rotation_key = json_util.getBoolField(ps_obj, "AllowRotationKey") orelse false,
+                .place_in_empty_blocks = json_util.getBoolField(ps_obj, "PlaceInEmptyBlocks") orelse false,
+            };
+        }
+
+        // Looping
+        if (json_util.getBoolField(obj, "Looping")) |b| {
+            block.looping = b;
+        }
+
+        return block;
+    }
+
+    /// Parse a single texture entry from JSON object into BlockTextures
+    fn parseBlockTextures(allocator: Allocator, tex_obj: std.json.ObjectMap, total_weight: f32) !BlockTextures {
+        var tex = BlockTextures{};
+
+        // Weight (normalized by total)
+        const raw_weight = json_util.getNumberFieldF32(tex_obj, "Weight") orelse 1.0;
+        tex.weight = raw_weight / total_weight;
+
+        // "All" sets all 6 faces
+        if (json_util.getStringField(tex_obj, "All")) |s| {
+            tex.top = try allocator.dupe(u8, s);
+            tex.bottom = try allocator.dupe(u8, s);
+            tex.front = try allocator.dupe(u8, s);
+            tex.back = try allocator.dupe(u8, s);
+            tex.left = try allocator.dupe(u8, s);
+            tex.right = try allocator.dupe(u8, s);
+        }
+
+        // "UpDown" overrides top+bottom
+        if (json_util.getStringField(tex_obj, "UpDown")) |s| {
+            if (tex.top) |old| allocator.free(old);
+            if (tex.bottom) |old| allocator.free(old);
+            tex.top = try allocator.dupe(u8, s);
+            tex.bottom = try allocator.dupe(u8, s);
+        }
+
+        // "Sides" overrides front/back/left/right
+        if (json_util.getStringField(tex_obj, "Sides")) |s| {
+            if (tex.front) |old| allocator.free(old);
+            if (tex.back) |old| allocator.free(old);
+            if (tex.left) |old| allocator.free(old);
+            if (tex.right) |old| allocator.free(old);
+            tex.front = try allocator.dupe(u8, s);
+            tex.back = try allocator.dupe(u8, s);
+            tex.left = try allocator.dupe(u8, s);
+            tex.right = try allocator.dupe(u8, s);
+        }
+
+        // Individual face overrides
+        // Java mapping: Up→top, Down→bottom, South→front, North→back, West→left, East→right
+        if (json_util.getStringField(tex_obj, "Up")) |s| {
+            if (tex.top) |old| allocator.free(old);
+            tex.top = try allocator.dupe(u8, s);
+        }
+        if (json_util.getStringField(tex_obj, "Down")) |s| {
+            if (tex.bottom) |old| allocator.free(old);
+            tex.bottom = try allocator.dupe(u8, s);
+        }
+        if (json_util.getStringField(tex_obj, "South")) |s| {
+            if (tex.front) |old| allocator.free(old);
+            tex.front = try allocator.dupe(u8, s);
+        }
+        if (json_util.getStringField(tex_obj, "North")) |s| {
+            if (tex.back) |old| allocator.free(old);
+            tex.back = try allocator.dupe(u8, s);
+        }
+        if (json_util.getStringField(tex_obj, "West")) |s| {
+            if (tex.left) |old| allocator.free(old);
+            tex.left = try allocator.dupe(u8, s);
+        }
+        if (json_util.getStringField(tex_obj, "East")) |s| {
+            if (tex.right) |old| allocator.free(old);
+            tex.right = try allocator.dupe(u8, s);
+        }
+
+        // If any faces are still null, fill with Unknown.png (matches Java defaults)
+        const unknown = "BlockTextures/Unknown.png";
+        if (tex.top == null) tex.top = try allocator.dupe(u8, unknown);
+        if (tex.bottom == null) tex.bottom = try allocator.dupe(u8, unknown);
+        if (tex.front == null) tex.front = try allocator.dupe(u8, unknown);
+        if (tex.back == null) tex.back = try allocator.dupe(u8, unknown);
+        if (tex.left == null) tex.left = try allocator.dupe(u8, unknown);
+        if (tex.right == null) tex.right = try allocator.dupe(u8, unknown);
+
+        return tex;
+    }
+
+    /// Parse DrawType from JSON string
+    fn parseDrawType(s: []const u8) DrawType {
+        if (std.mem.eql(u8, s, "Cube")) return .cube;
+        if (std.mem.eql(u8, s, "Model")) return .model;
+        if (std.mem.eql(u8, s, "CubeWithModel")) return .cube_with_model;
+        if (std.mem.eql(u8, s, "GizmoCube")) return .gizmo_cube;
+        if (std.mem.eql(u8, s, "Empty")) return .empty;
+        return .cube; // default
+    }
+
+    /// Parse BlockMaterial from JSON string
+    fn parseMaterial(s: []const u8) BlockMaterial {
+        if (std.mem.eql(u8, s, "Solid")) return .solid;
+        if (std.mem.eql(u8, s, "Empty")) return .empty;
+        return .empty; // default
+    }
+
+    /// Parse Opacity from JSON string
+    fn parseOpacity(s: []const u8) Opacity {
+        if (std.mem.eql(u8, s, "Solid")) return .solid;
+        if (std.mem.eql(u8, s, "Semitransparent")) return .semitransparent;
+        if (std.mem.eql(u8, s, "Cutout")) return .cutout;
+        if (std.mem.eql(u8, s, "Transparent")) return .transparent;
+        return .solid; // default
+    }
+
+    /// Parse hex color string "#RRGGBB" or "#RGB" into Color
+    fn parseHexColor(hex: []const u8) ?Color {
+        var start: usize = 0;
+        if (hex.len > 0 and hex[0] == '#') start = 1;
+        const slice = hex[start..];
+
+        if (slice.len == 6) {
+            // #RRGGBB
+            const r = std.fmt.parseInt(u8, slice[0..2], 16) catch return null;
+            const g = std.fmt.parseInt(u8, slice[2..4], 16) catch return null;
+            const b = std.fmt.parseInt(u8, slice[4..6], 16) catch return null;
+            return .{ .r = r, .g = g, .b = b };
+        } else if (slice.len == 3) {
+            // #RGB → expand to #RRGGBB
+            const r = std.fmt.parseInt(u8, slice[0..1], 16) catch return null;
+            const g = std.fmt.parseInt(u8, slice[1..2], 16) catch return null;
+            const b = std.fmt.parseInt(u8, slice[2..3], 16) catch return null;
+            return .{ .r = r * 17, .g = g * 17, .b = b * 17 };
+        }
+        return null;
     }
 };
 
